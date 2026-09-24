@@ -1,79 +1,47 @@
 """
 IsoVita
-============
+=======
 
-Unified temporal isoform-trajectory analysis with one feature per gene and
-three parallel detection branches.
+Core temporal isoform-trajectory analysis operating on standardized TPM input.
 
-Shared representation
----------------------
-1. Prepare postnatal transcript-level TPM data.
+Input contract
+--------------
+``run_isovita_pipeline()`` expects inputs that have already been prepared at the
+dataset level (for example by ``prepare_isovita_inputs.py``):
+
+* ``tpm``: transcript-level TPM table with columns ``gene_id``,
+  ``transcript_id``, followed by one column per retained sample;
+* ``metadata``: one row per retained sample with canonical columns
+  ``sample_id`` and numeric ``age``. Sample order must match the TPM columns.
+
+The core module deliberately does not perform cohort filtering, postnatal
+filtering, sample-ID parsing, transcript-to-gene mapping, or metadata column
+auto-detection. Those belong in the preparation layer.
+
+Core algorithm
+--------------
+1. Apply the configured TPM eligibility filter used for IsoPlex input.
 2. Run IsoPlex and identify effective isoforms.
-3. Exclude genes with <2 effective isoforms. Every gene with >=2 effective
-   isoforms follows the SAME condensation procedure:
-      a. renormalize TPM within the effective-isoform set to a composition;
-      b. CLR-transform the effective-isoform composition;
-      c. fit one smooth CLR trajectory per effective isoform versus age;
-      d. center fitted trajectories over a common age grid and use SVD to
-         obtain the dominant temporal direction (PC1);
-      e. exhaustively search A/B/unused isoform assignments and choose the
-         simplest balance whose cosine similarity is near the optimum;
-      f. define one gene feature as log(GM(Group A) / GM(Group B)).
-   For K=2 effective isoforms the same method reduces to the unique two-part
-   log-ratio; a direct computational shortcut is used, but it is not a
-   separate statistical branch.
+3. For every gene with >=2 effective isoforms, build one age-informed feature:
+   effective-isoform composition -> CLR -> smooth trajectories -> PC1 ->
+   simplest near-optimal A/B balance -> log(GM(A) / GM(B)).
+4. Run only the temporal detection branches requested by the user:
+   ``discrete``, ``continuous``, and/or ``localized``.
+5. Return branch-specific results and a final gene set equal to the union of
+   FDR-significant genes from the selected branches. With one selected branch,
+   the final set is exactly that branch's selected genes.
 
-Parallel temporal detection
----------------------------
-The same one-feature-per-gene matrix is passed independently to three branches:
+The branches are parallel detectors, not mutually exclusive trajectory classes.
+IsoVita has no SPIT dependency.
 
-1. Discrete branch
-   Detect one unknown pure level shift over age. Candidate change points are
-   boundaries between distinct observed ages that satisfy configurable minimum
-   sample-size constraints on both sides. The best cut maximizes the nested
-   constant-vs-step F statistic. Significance is obtained by permuting feature
-   values across ages and repeating the ENTIRE change-point search, so the
-   gene-level permutation p-value accounts for selecting the cut point. BH is
-   then applied across genes.
-
-2. Continuous branch
-   Test a global spline(age) model against an intercept-only model, followed
-   by BH across genes.
-
-3. Localized branch
-   Test spline(age) models within configured age windows, followed by BH
-   across successfully tested gene-window hypotheses.
-
-The three branches are parallel detectors, not mutually exclusive trajectory
-classes. Their FDR-significant evidence is merged at the gene level into a
-trajectory signature such as discrete, continuous+localized, or
- discrete+continuous+localized. The final feature list is the union of genes
-selected by any branch.
-
-SPIT
-----
-IsoVita has no SPIT dependency. The former SPIT wrapper has been removed.
-
-Numerical / inferential notes
------------------------------
-* CLR and geometric-mean log-ratios require strictly positive compositions.
-  A small configurable pseudocount is therefore added to effective-isoform
-  fractions and the composition is renormalized. The default is 1e-8.
-* "Near-optimal" balance is configurable. By default, any balance within
-  0.01 absolute cosine similarity of the best balance is considered
-  near-optimal; among these, the balance using the fewest isoforms is chosen,
-  then the highest-cosine balance breaks remaining ties.
-* Candidate balance directions depend only on K, not on the gene. For modest
-  K they are cached and reused across genes.
-* The balance itself is learned using age. Therefore, p/q-values from all
-  three downstream branches are screening/characterization statistics when
-  the same samples are used for balance learning and testing. The discrete
-  permutation test corrects the within-branch search over change points, but
-  it does NOT correct for age-informed balance construction. Formal
-  confirmatory inference would require a pre-condensation test or sample
-  splitting/cross-fitting.
-* This module defines functions only; it does not execute the pipeline on
-  import.
+Inferential note
+----------------
+The balance is learned using age. Therefore downstream p/q-values are best
+interpreted as screening/characterization statistics when the same samples are
+used for balance learning and testing. The discrete permutation test corrects
+its internal change-point search, but not the upstream age-informed balance
+construction. Confirmatory inference would require a pre-condensation test or
+sample splitting/cross-fitting.
 """
 
 from __future__ import annotations
@@ -82,7 +50,6 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
-import re
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -196,7 +163,7 @@ class FeatureTestConfig:
 
 @dataclass(frozen=True)
 class SelectionConfig:
-    """Final union/ranking settings after the three branches are merged."""
+    """Final union/ranking settings after the selected branches are merged."""
 
     # None retains every gene selected by at least one branch. Set an integer
     # only when a downstream use case explicitly requires a top-N subset.
@@ -221,11 +188,12 @@ class IsoVitaConfig:
 
 @dataclass
 class IsoVitaPipelineResult:
-    """Container for shared intermediates and all three temporal branches."""
+    """Container for shared intermediates and the user-selected branches."""
 
-    postnatal_meta: pd.DataFrame
-    full_expression_df: pd.DataFrame
-    expression_df: pd.DataFrame
+    selected_branches: Tuple[str, ...]
+    metadata: pd.DataFrame
+    tpm: pd.DataFrame
+    isoplex_expression_df: pd.DataFrame
     isoplex_filter_summary: pd.DataFrame
     sample_metrics: pd.DataFrame
     global_metrics: pd.DataFrame
@@ -246,23 +214,6 @@ class IsoVitaPipelineResult:
 # ============================================================================
 # GENERAL HELPERS
 # ============================================================================
-
-
-def detect_sample_id_column(df: pd.DataFrame) -> str:
-    for candidate in ("sample_id", "id", "sample", "ID", "SampleID"):
-        if candidate in df.columns:
-            return candidate
-    raise ValueError(
-        "Could not find sample ID column. Expected one of: "
-        "sample_id, id, sample, ID, SampleID."
-    )
-
-
-def detect_age_column(df: pd.DataFrame) -> str:
-    for candidate in ("age", "Age", "AGE"):
-        if candidate in df.columns:
-            return candidate
-    raise ValueError("Could not find age column in metadata.")
 
 
 def robust_amplitude(
@@ -311,165 +262,135 @@ def add_bh_fdr(
 
 
 # ============================================================================
-# INPUT / PREPROCESSING
+# CORE INPUT CONTRACT / ISOPLEX TPM FILTER
 # ============================================================================
 
 
-def prepare_metadata(
+VALID_BRANCHES: Tuple[str, ...] = ("discrete", "continuous", "localized")
+
+
+def normalize_branches(branches: Sequence[str]) -> Tuple[str, ...]:
+    """Validate branch selection and return it in canonical algorithm order."""
+    if isinstance(branches, str):
+        requested = [branches]
+    else:
+        requested = [str(branch) for branch in branches]
+
+    if not requested:
+        raise ValueError(
+            "At least one IsoVita branch must be selected from: "
+            f"{', '.join(VALID_BRANCHES)}."
+        )
+
+    unknown = sorted(set(requested) - set(VALID_BRANCHES))
+    if unknown:
+        raise ValueError(
+            f"Unknown IsoVita branch(es): {unknown}. "
+            f"Choose from: {', '.join(VALID_BRANCHES)}."
+        )
+
+    if len(requested) != len(set(requested)):
+        raise ValueError("Duplicate branch names are not allowed.")
+
+    return tuple(branch for branch in VALID_BRANCHES if branch in requested)
+
+
+def validate_core_inputs(
+    tpm: pd.DataFrame,
     metadata: pd.DataFrame,
-    *,
-    sample_col: Optional[str] = None,
-    age_col: Optional[str] = None,
-    postnatal_only: bool = True,
-) -> pd.DataFrame:
-    """Standardize metadata to index=sample with numeric age."""
-    meta = metadata.copy()
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """Validate standardized TPM/metadata without performing dataset filtering."""
+    required_tpm = {"gene_id", "transcript_id"}
+    missing_tpm = required_tpm - set(tpm.columns)
+    if missing_tpm:
+        raise ValueError(
+            "TPM input must already be gene-annotated. Missing columns: "
+            f"{sorted(missing_tpm)}. Run prepare_isovita_inputs.py first."
+        )
 
-    sample_col = sample_col or detect_sample_id_column(meta)
-    age_col = age_col or detect_age_column(meta)
+    required_meta = {"sample_id", "age"}
+    missing_meta = required_meta - set(metadata.columns)
+    if missing_meta:
+        raise ValueError(
+            "Metadata must already contain canonical columns sample_id and age. "
+            f"Missing: {sorted(missing_meta)}."
+        )
 
-    meta[age_col] = pd.to_numeric(meta[age_col], errors="coerce")
-    meta = meta.dropna(subset=[sample_col, age_col]).copy()
-    meta[sample_col] = meta[sample_col].astype(str)
-
-    if postnatal_only:
-        meta = meta.loc[meta[age_col] >= 0].copy()
-
-    meta = meta.set_index(sample_col, drop=True)
-    meta.index.name = "sample"
-    meta = meta.rename(columns={age_col: "age"})
-    return meta
-
-
-def normalize_tx2gene_table(
-    tx2gene: pd.DataFrame,
-    *,
-    transcript_col: Optional[str] = None,
-    gene_col: Optional[str] = None,
-) -> pd.DataFrame:
-    """Normalize a transcript-to-gene table to tx_id / gene_id."""
-    mapping = tx2gene.copy()
-
-    if transcript_col is None:
-        for candidate in ("tx_id", "transcript_id", "transcript"):
-            if candidate in mapping.columns:
-                transcript_col = candidate
-                break
-
-    if gene_col is None:
-        for candidate in ("gene_id", "gene"):
-            if candidate in mapping.columns:
-                gene_col = candidate
-                break
-
-    if transcript_col is None or gene_col is None:
-        raise ValueError("Could not identify transcript and gene columns in tx2gene.")
-
-    mapping = mapping[[transcript_col, gene_col]].copy()
-    mapping = mapping.rename(
-        columns={transcript_col: "tx_id", gene_col: "gene_id"}
-    )
-    mapping["tx_id"] = mapping["tx_id"].astype(str)
-    mapping["gene_id"] = mapping["gene_id"].astype(str)
-
-    return mapping.drop_duplicates("tx_id").reset_index(drop=True)
-
-
-def prepare_full_expression(
-    tpm: pd.DataFrame,
-    tx2gene: pd.DataFrame,
-    postnatal_meta: pd.DataFrame,
-    *,
-    tx_col: str = "tx_id",
-) -> Tuple[pd.DataFrame, List[str]]:
-    """Build the canonical unfiltered postnatal transcript-level TPM table."""
-    if tx_col not in tpm.columns:
-        raise ValueError(f"TPM table must contain '{tx_col}'.")
-
-    mapping = normalize_tx2gene_table(tx2gene)
     expr = tpm.copy()
-    expr[tx_col] = expr[tx_col].astype(str)
+    expr["gene_id"] = expr["gene_id"].astype(str)
+    expr["transcript_id"] = expr["transcript_id"].astype(str)
 
-    expr = expr.merge(
-        mapping,
-        left_on=tx_col,
-        right_on="tx_id",
-        how="left",
-        suffixes=("", "_mapping"),
-    )
+    if expr["transcript_id"].duplicated().any():
+        duplicated = (
+            expr.loc[expr["transcript_id"].duplicated(keep=False), "transcript_id"]
+            .unique()
+            .tolist()
+        )
+        raise ValueError(
+            "TPM transcript_id values must be unique. "
+            f"Examples: {duplicated[:10]}"
+        )
 
-    if tx_col != "tx_id":
-        expr = expr.drop(columns=["tx_id"]).rename(columns={tx_col: "tx_id"})
+    meta = metadata.copy()
+    meta["sample_id"] = meta["sample_id"].astype(str)
+    meta["age"] = pd.to_numeric(meta["age"], errors="coerce")
+    if meta["sample_id"].duplicated().any():
+        raise ValueError("Metadata sample_id values must be unique.")
+    if meta["age"].isna().any():
+        raise ValueError("Metadata age must be numeric and non-missing.")
 
-    expr = expr.dropna(subset=["gene_id"]).copy()
-
-    all_sample_cols = [
-        col for col in expr.columns
-        if col not in {"gene_id", "tx_id", "tx_id_mapping"}
+    sample_cols = [
+        str(column) for column in expr.columns
+        if column not in {"gene_id", "transcript_id"}
     ]
-    meta_samples = set(postnatal_meta.index.astype(str))
-    sample_cols = [col for col in all_sample_cols if str(col) in meta_samples]
-
     if not sample_cols:
-        raise ValueError("No overlapping postnatal samples between TPM and metadata.")
+        raise ValueError("TPM input contains no sample columns.")
 
-    expr[sample_cols] = (
-        expr[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    )
+    rename_map = {
+        column: str(column)
+        for column in expr.columns
+        if column not in {"gene_id", "transcript_id"}
+    }
+    expr = expr.rename(columns=rename_map)
 
-    expr = expr.rename(columns={"tx_id": "transcript_id"})
-    expr = expr[["gene_id", "transcript_id"] + sample_cols].copy()
+    if len(sample_cols) != len(set(sample_cols)):
+        raise ValueError("TPM sample columns are not unique after string conversion.")
 
-    return expr, sample_cols
+    metadata_samples = meta["sample_id"].tolist()
+    if sample_cols != metadata_samples:
+        raise ValueError(
+            "TPM sample columns must exactly match metadata sample_id values in "
+            "the same order. Harmonize/filter samples in prepare_isovita_inputs.py."
+        )
+
+    numeric = expr[sample_cols].apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any():
+        raise ValueError("TPM sample values must be finite numeric values.")
+    values = numeric.to_numpy(dtype=float)
+    if np.any(~np.isfinite(values)):
+        raise ValueError("TPM sample values must be finite numeric values.")
+    if np.any(values < 0):
+        raise ValueError("TPM values must be non-negative.")
+    expr[sample_cols] = numeric
+
+    meta = meta.set_index("sample_id", drop=True)
+    meta.index.name = "sample"
+    return expr, meta, sample_cols
 
 
-def prepare_isoplex_expression(
+def filter_tpm_for_isoplex(
     tpm: pd.DataFrame,
-    tx2gene: pd.DataFrame,
-    postnatal_meta: pd.DataFrame,
+    sample_cols: Sequence[str],
     *,
     config: IsoPlexConfig = IsoPlexConfig(),
-    tx_col: str = "tx_id",
-) -> Tuple[pd.DataFrame, List[str], pd.DataFrame]:
-    """Merge TPM with gene IDs and apply gentle IsoPlex input filters."""
-    if tx_col not in tpm.columns:
-        raise ValueError(f"TPM table must contain '{tx_col}'.")
-
-    mapping = normalize_tx2gene_table(tx2gene)
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the algorithm's TPM eligibility filters before running IsoPlex."""
     expr = tpm.copy()
-    expr[tx_col] = expr[tx_col].astype(str)
-
-    expr = expr.merge(
-        mapping,
-        left_on=tx_col,
-        right_on="tx_id",
-        how="left",
-        suffixes=("", "_mapping"),
-    )
-
-    if tx_col != "tx_id":
-        expr = expr.drop(columns=["tx_id"]).rename(columns={tx_col: "tx_id"})
-
-    expr = expr.dropna(subset=["gene_id"]).copy()
-
-    all_sample_cols = [
-        col for col in expr.columns
-        if col not in {"gene_id", "tx_id", "tx_id_mapping"}
-    ]
-
-    meta_samples = set(postnatal_meta.index.astype(str))
-    sample_cols = [col for col in all_sample_cols if str(col) in meta_samples]
-
-    if not sample_cols:
-        raise ValueError("No overlapping postnatal samples between TPM and metadata.")
-
-    expr[sample_cols] = (
-        expr[sample_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    )
+    sample_cols = list(sample_cols)
 
     summary_rows = [{
-        "step": "raw_merged",
-        "n_transcripts": int(expr["tx_id"].nunique()),
+        "step": "core_tpm_input",
+        "n_transcripts": int(expr["transcript_id"].nunique()),
         "n_genes": int(expr["gene_id"].nunique()),
     }]
 
@@ -478,28 +399,29 @@ def prepare_isoplex_expression(
         >= config.min_samples_above_tpm
     )
     expr = expr.loc[keep_tx].copy()
-
     summary_rows.append({
         "step": "transcript_filter",
-        "n_transcripts": int(expr["tx_id"].nunique()),
+        "n_transcripts": int(expr["transcript_id"].nunique()),
         "n_genes": int(expr["gene_id"].nunique()),
     })
 
-    if config.require_positive_gene_total_every_sample:
+    if config.require_positive_gene_total_every_sample and not expr.empty:
         gene_total = expr.groupby("gene_id")[sample_cols].transform("sum")
         keep_gene = (gene_total > 0).all(axis=1)
         expr = expr.loc[keep_gene].copy()
 
     summary_rows.append({
         "step": "gene_total_filter",
-        "n_transcripts": int(expr["tx_id"].nunique()),
+        "n_transcripts": int(expr["transcript_id"].nunique()),
         "n_genes": int(expr["gene_id"].nunique()),
     })
 
-    expr = expr.rename(columns={"tx_id": "transcript_id"})
-    expr = expr[["gene_id", "transcript_id"] + sample_cols].copy()
+    if expr.empty:
+        raise ValueError(
+            "No transcripts remain after the configured IsoPlex TPM filters."
+        )
 
-    return expr, sample_cols, pd.DataFrame(summary_rows)
+    return expr, pd.DataFrame(summary_rows)
 
 
 # ============================================================================
@@ -1672,19 +1594,49 @@ def run_localized_feature_tests(
 
 
 # ---------------------------------------------------------------------------
-# MERGE THE THREE PARALLEL BRANCHES
+# MERGE USER-SELECTED PARALLEL BRANCHES
 # ---------------------------------------------------------------------------
 
 
-def _trajectory_signature(row: pd.Series) -> str:
-    labels = []
-    if bool(row.get("discrete_fdr_significant", False)):
-        labels.append("discrete")
-    if bool(row.get("continuous_fdr_significant", False)):
-        labels.append("continuous")
-    if bool(row.get("localized_fdr_significant", False)):
-        labels.append("localized")
+def _trajectory_signature(row: pd.Series, branches: Sequence[str]) -> str:
+    labels = [
+        branch
+        for branch in branches
+        if bool(row.get(f"{branch}_fdr_significant", False))
+    ]
     return "+".join(labels) if labels else "not_selected"
+
+
+def _localized_gene_summary(
+    localized_results: pd.DataFrame,
+    gene_ids: pd.Series,
+) -> pd.DataFrame:
+    if localized_results.empty:
+        return pd.DataFrame({"gene_id": gene_ids.astype(str)})
+
+    win = localized_results.copy()
+    win["is_sig"] = win["fdr_significant"].fillna(False).astype(bool)
+    agg_rows = []
+    for gene_id, sub in win.groupby("gene_id", sort=False):
+        sig = sub.loc[sub["is_sig"]].sort_values(
+            ["q_value", "p_value"], na_position="last"
+        )
+        best = sub.sort_values(
+            ["q_value", "p_value"], na_position="last"
+        ).iloc[0]
+        agg_rows.append({
+            "gene_id": str(gene_id),
+            "n_tested_windows": int(sub["tested"].fillna(False).sum()),
+            "n_significant_windows": int(sub["is_sig"].sum()),
+            "significant_windows": "|".join(sig["window"].astype(str).tolist()),
+            "best_window": str(best["window"]),
+            "best_window_p_value": best["p_value"],
+            "best_window_q_value": best["q_value"],
+            "best_window_r_squared": best["r_squared"],
+            "best_window_fitted_robust_amp": best["fitted_robust_amp"],
+            "localized_fdr_significant": bool(sub["is_sig"].any()),
+        })
+    return pd.DataFrame(agg_rows)
 
 
 def summarize_gene_trajectories(
@@ -1692,109 +1644,83 @@ def summarize_gene_trajectories(
     discrete_results: pd.DataFrame,
     continuous_results: pd.DataFrame,
     localized_results: pd.DataFrame,
+    *,
+    branches: Sequence[str] = VALID_BRANCHES,
 ) -> pd.DataFrame:
-    """Merge independent discrete, continuous, and localized evidence per gene."""
+    """Merge evidence from exactly the branches requested by the user."""
+    branches = normalize_branches(branches)
     ok_balance = balance_summary.loc[balance_summary["status"].eq("ok")].copy()
     if ok_balance.empty:
         return ok_balance
 
-    discrete_keep = discrete_results.copy()
-    if not discrete_keep.empty:
-        discrete_keep = discrete_keep.rename(columns={
-            "p_value": "discrete_p_value",
-            "q_value": "discrete_q_value",
-            "fdr_significant": "discrete_fdr_significant",
-            "max_f_stat": "discrete_max_f_stat",
-            "step_r_squared": "discrete_step_r_squared",
-            "step_effect": "discrete_step_effect",
-            "abs_step_effect": "discrete_abs_step_effect",
-            "best_change_age": "discrete_change_age",
-            "left_mean": "discrete_left_mean",
-            "right_mean": "discrete_right_mean",
-            "n_left": "discrete_n_left",
-            "n_right": "discrete_n_right",
-            "n_candidate_cuts": "discrete_n_candidate_cuts",
-        })
-        keep_cols = [
-            "gene_id", "discrete_p_value", "discrete_q_value",
-            "discrete_fdr_significant", "discrete_max_f_stat",
-            "discrete_step_r_squared", "discrete_step_effect",
-            "discrete_abs_step_effect", "discrete_change_age",
-            "discrete_left_mean", "discrete_right_mean",
-            "discrete_n_left", "discrete_n_right",
-            "discrete_n_candidate_cuts",
-        ]
-        discrete_keep = discrete_keep[[
-            c for c in keep_cols if c in discrete_keep.columns
-        ]]
-    else:
-        discrete_keep = pd.DataFrame({"gene_id": ok_balance["gene_id"]})
+    summary = ok_balance.copy()
 
-    continuous_keep = continuous_results.copy()
-    if not continuous_keep.empty:
-        continuous_keep = continuous_keep.rename(columns={
-            "p_value": "continuous_p_value",
-            "q_value": "continuous_q_value",
-            "fdr_significant": "continuous_fdr_significant",
-            "f_stat": "continuous_f_stat",
-            "r_squared": "continuous_r_squared",
-            "fitted_robust_amp": "continuous_fitted_robust_amp",
-            "pearson_r": "continuous_pearson_r",
-            "spearman_r": "continuous_spearman_r",
-            "abs_pearson_r": "continuous_abs_pearson_r",
-        })
-        keep_cols = [
-            "gene_id", "continuous_p_value", "continuous_q_value",
-            "continuous_fdr_significant", "continuous_f_stat",
-            "continuous_r_squared", "continuous_fitted_robust_amp",
-            "continuous_pearson_r", "continuous_spearman_r",
-            "continuous_abs_pearson_r", "score_predictive_hybrid",
-        ]
-        continuous_keep = continuous_keep[[
-            c for c in keep_cols if c in continuous_keep.columns
-        ]]
-    else:
-        continuous_keep = pd.DataFrame({"gene_id": ok_balance["gene_id"]})
-
-    if localized_results.empty:
-        localized_agg = pd.DataFrame({"gene_id": ok_balance["gene_id"]})
-    else:
-        win = localized_results.copy()
-        win["is_sig"] = win["fdr_significant"].fillna(False).astype(bool)
-
-        agg_rows = []
-        for gene_id, sub in win.groupby("gene_id", sort=False):
-            sig = sub.loc[sub["is_sig"]].sort_values(
-                ["q_value", "p_value"],
-                na_position="last",
-            )
-            best = sub.sort_values(
-                ["q_value", "p_value"],
-                na_position="last",
-            ).iloc[0]
-            agg_rows.append({
-                "gene_id": str(gene_id),
-                "n_tested_windows": int(sub["tested"].fillna(False).sum()),
-                "n_significant_windows": int(sub["is_sig"].sum()),
-                "significant_windows": "|".join(sig["window"].astype(str).tolist()),
-                "best_window": str(best["window"]),
-                "best_window_p_value": best["p_value"],
-                "best_window_q_value": best["q_value"],
-                "best_window_r_squared": best["r_squared"],
-                "best_window_fitted_robust_amp": best["fitted_robust_amp"],
-                "localized_fdr_significant": bool(sub["is_sig"].any()),
+    if "discrete" in branches:
+        discrete_keep = discrete_results.copy()
+        if not discrete_keep.empty:
+            discrete_keep = discrete_keep.rename(columns={
+                "p_value": "discrete_p_value",
+                "q_value": "discrete_q_value",
+                "fdr_significant": "discrete_fdr_significant",
+                "max_f_stat": "discrete_max_f_stat",
+                "step_r_squared": "discrete_step_r_squared",
+                "step_effect": "discrete_step_effect",
+                "abs_step_effect": "discrete_abs_step_effect",
+                "best_change_age": "discrete_change_age",
+                "left_mean": "discrete_left_mean",
+                "right_mean": "discrete_right_mean",
+                "n_left": "discrete_n_left",
+                "n_right": "discrete_n_right",
+                "n_candidate_cuts": "discrete_n_candidate_cuts",
             })
-        localized_agg = pd.DataFrame(agg_rows)
+            keep_cols = [
+                "gene_id", "discrete_p_value", "discrete_q_value",
+                "discrete_fdr_significant", "discrete_max_f_stat",
+                "discrete_step_r_squared", "discrete_step_effect",
+                "discrete_abs_step_effect", "discrete_change_age",
+                "discrete_left_mean", "discrete_right_mean",
+                "discrete_n_left", "discrete_n_right",
+                "discrete_n_candidate_cuts",
+            ]
+            discrete_keep = discrete_keep[[
+                c for c in keep_cols if c in discrete_keep.columns
+            ]]
+            summary = summary.merge(discrete_keep, on="gene_id", how="left")
 
-    summary = ok_balance.merge(discrete_keep, on="gene_id", how="left")
-    summary = summary.merge(continuous_keep, on="gene_id", how="left")
-    summary = summary.merge(localized_agg, on="gene_id", how="left")
+    if "continuous" in branches:
+        continuous_keep = continuous_results.copy()
+        if not continuous_keep.empty:
+            continuous_keep = continuous_keep.rename(columns={
+                "p_value": "continuous_p_value",
+                "q_value": "continuous_q_value",
+                "fdr_significant": "continuous_fdr_significant",
+                "f_stat": "continuous_f_stat",
+                "r_squared": "continuous_r_squared",
+                "fitted_robust_amp": "continuous_fitted_robust_amp",
+                "pearson_r": "continuous_pearson_r",
+                "spearman_r": "continuous_spearman_r",
+                "abs_pearson_r": "continuous_abs_pearson_r",
+            })
+            keep_cols = [
+                "gene_id", "continuous_p_value", "continuous_q_value",
+                "continuous_fdr_significant", "continuous_f_stat",
+                "continuous_r_squared", "continuous_fitted_robust_amp",
+                "continuous_pearson_r", "continuous_spearman_r",
+                "continuous_abs_pearson_r", "score_predictive_hybrid",
+            ]
+            continuous_keep = continuous_keep[[
+                c for c in keep_cols if c in continuous_keep.columns
+            ]]
+            summary = summary.merge(continuous_keep, on="gene_id", how="left")
 
-    for col in (
-        "discrete_fdr_significant",
-        "continuous_fdr_significant",
-        "localized_fdr_significant",
-    ):
+    if "localized" in branches:
+        localized_agg = _localized_gene_summary(
+            localized_results, ok_balance["gene_id"]
+        )
+        summary = summary.merge(localized_agg, on="gene_id", how="left")
+
+    for branch in VALID_BRANCHES:
+        col = f"{branch}_fdr_significant"
         if col not in summary.columns:
             summary[col] = False
         summary[col] = summary[col].fillna(False).astype(bool)
@@ -1805,30 +1731,20 @@ def summarize_gene_trajectories(
         summary["n_significant_windows"].fillna(0).astype(int)
     )
 
+    selected_sig_cols = [f"{branch}_fdr_significant" for branch in branches]
     summary["n_detection_branches"] = (
-        summary[
-            [
-                "discrete_fdr_significant",
-                "continuous_fdr_significant",
-                "localized_fdr_significant",
-            ]
-        ]
-        .astype(int)
-        .sum(axis=1)
+        summary[selected_sig_cols].astype(int).sum(axis=1)
     )
     summary["trajectory_signature"] = summary.apply(
-        _trajectory_signature,
-        axis=1,
+        lambda row: _trajectory_signature(row, branches), axis=1
     )
 
-    q_cols = [
-        c for c in (
-            "discrete_q_value",
-            "continuous_q_value",
-            "best_window_q_value",
-        )
-        if c in summary.columns
-    ]
+    q_col_map = {
+        "discrete": "discrete_q_value",
+        "continuous": "continuous_q_value",
+        "localized": "best_window_q_value",
+    }
+    q_cols = [q_col_map[b] for b in branches if q_col_map[b] in summary.columns]
     summary["min_branch_q_value"] = (
         summary[q_cols].min(axis=1, skipna=True) if q_cols else np.nan
     )
@@ -1843,26 +1759,28 @@ def summarize_gene_trajectories(
 def select_final_gene_features(
     gene_summary: pd.DataFrame,
     *,
+    branches: Sequence[str] = VALID_BRANCHES,
     config: SelectionConfig = SelectionConfig(),
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Return branch-specific candidate tables plus their unique union."""
+    """Return selected-branch candidates and their unique gene-level union."""
+    branches = normalize_branches(branches)
     if gene_summary.empty:
         empty = gene_summary.copy()
         return empty, empty, empty, empty
 
-    discrete = gene_summary.loc[
-        gene_summary["discrete_fdr_significant"].fillna(False)
-    ].copy()
-    continuous = gene_summary.loc[
-        gene_summary["continuous_fdr_significant"].fillna(False)
-    ].copy()
-    localized = gene_summary.loc[
-        gene_summary["localized_fdr_significant"].fillna(False)
-    ].copy()
+    candidate_tables: Dict[str, pd.DataFrame] = {}
+    for branch in VALID_BRANCHES:
+        sig_col = f"{branch}_fdr_significant"
+        if branch in branches and sig_col in gene_summary.columns:
+            candidate_tables[branch] = gene_summary.loc[
+                gene_summary[sig_col].fillna(False)
+            ].copy()
+        else:
+            candidate_tables[branch] = gene_summary.iloc[0:0].copy()
 
-    selected = gene_summary.loc[
-        gene_summary["n_detection_branches"] > 0
-    ].copy()
+    selected_sig_cols = [f"{branch}_fdr_significant" for branch in branches]
+    selected_mask = gene_summary[selected_sig_cols].fillna(False).any(axis=1)
+    selected = gene_summary.loc[selected_mask].copy()
     selected = selected.sort_values(
         ["n_detection_branches", "min_branch_q_value", "gene_id"],
         ascending=[False, True, True],
@@ -1875,9 +1793,9 @@ def select_final_gene_features(
     selected.insert(0, "rank_gene", np.arange(1, len(selected) + 1))
 
     return (
-        discrete.reset_index(drop=True),
-        continuous.reset_index(drop=True),
-        localized.reset_index(drop=True),
+        candidate_tables["discrete"].reset_index(drop=True),
+        candidate_tables["continuous"].reset_index(drop=True),
+        candidate_tables["localized"].reset_index(drop=True),
         selected.reset_index(drop=True),
     )
 
@@ -1890,91 +1808,82 @@ def select_final_gene_features(
 def run_isovita_pipeline(
     *,
     tpm: pd.DataFrame,
-    tx2gene: pd.DataFrame,
     metadata: pd.DataFrame,
+    branches: Sequence[str] = VALID_BRANCHES,
     config: IsoVitaConfig = IsoVitaConfig(),
-    sample_col: Optional[str] = None,
-    age_col: Optional[str] = None,
     progress_every: Optional[int] = None,
 ) -> IsoVitaPipelineResult:
-    """Run the unified three-branch IsoVita workflow end-to-end."""
-    postnatal_meta = prepare_metadata(
-        metadata,
-        sample_col=sample_col,
-        age_col=age_col,
-        postnatal_only=True,
+    """Run IsoVita using only the requested temporal detection branches.
+
+    Parameters
+    ----------
+    tpm
+        Standardized transcript-level TPM table with ``gene_id``,
+        ``transcript_id``, then one column per retained sample.
+    metadata
+        Standardized sample metadata with columns ``sample_id`` and ``age``.
+        It must already reflect all dataset/cohort filtering.
+    branches
+        Any non-empty subset of ``("discrete", "continuous", "localized")``.
+        Only selected branches are executed. The final gene list is their union.
+    """
+    selected_branches = normalize_branches(branches)
+    full_tpm, meta, sample_cols = validate_core_inputs(tpm, metadata)
+
+    isoplex_expression_df, isoplex_filter_summary = filter_tpm_for_isoplex(
+        full_tpm, sample_cols, config=config.isoplex
     )
-
-    full_expression_df, full_sample_cols = prepare_full_expression(
-        tpm,
-        tx2gene,
-        postnatal_meta,
-    )
-
-    (
-        expression_df,
-        sample_cols,
-        isoplex_filter_summary,
-    ) = prepare_isoplex_expression(
-        tpm,
-        tx2gene,
-        postnatal_meta,
-        config=config.isoplex,
-    )
-
-    if list(full_sample_cols) != list(sample_cols):
-        raise ValueError(
-            "Canonical and IsoPlex expression tables do not have matching "
-            "postnatal sample columns."
-        )
-
-    postnatal_meta = postnatal_meta.loc[list(sample_cols)].copy()
-
-    sample_metrics, global_metrics = run_isoplex(expression_df)
+    sample_metrics, global_metrics = run_isoplex(isoplex_expression_df)
     gene_routes = route_genes_by_effective_isoform_count(global_metrics)
 
-    # Balance construction uses only IsoPlex-effective isoforms, renormalized
-    # within that effective set. full_expression_df supplies their unfiltered
-    # TPM values while IsoPlex determines membership in the effective set.
+    # IsoPlex determines effective-isoform membership. Feature values are then
+    # computed from the original prepared TPM values for those effective isoforms.
     balance_summary, balance_loadings, balance_feature_matrix = (
         build_one_feature_per_gene(
-            expression_df=full_expression_df,
+            expression_df=full_tpm,
             global_metrics=global_metrics,
             sample_cols=sample_cols,
-            metadata=postnatal_meta,
+            metadata=meta,
             config=config.balance,
             progress_every=progress_every,
         )
     )
 
-    # Three completely parallel detectors on the SAME gene-feature matrix.
-    discrete_results = run_discrete_feature_tests(
-        balance_feature_matrix,
-        postnatal_meta,
-        config=config.discrete,
-        progress_every=progress_every,
-    )
+    discrete_results = pd.DataFrame()
+    continuous_results = pd.DataFrame()
+    localized_results = pd.DataFrame()
 
-    continuous_results = run_continuous_feature_tests(
-        balance_feature_matrix,
-        postnatal_meta,
-        config=config.feature_test,
-        progress_every=progress_every,
-    )
+    if "discrete" in selected_branches:
+        discrete_results = run_discrete_feature_tests(
+            balance_feature_matrix,
+            meta,
+            config=config.discrete,
+            progress_every=progress_every,
+        )
 
-    localized_results = run_localized_feature_tests(
-        balance_feature_matrix,
-        postnatal_meta,
-        windows=config.windows,
-        config=config.feature_test,
-        progress_every=progress_every,
-    )
+    if "continuous" in selected_branches:
+        continuous_results = run_continuous_feature_tests(
+            balance_feature_matrix,
+            meta,
+            config=config.feature_test,
+            progress_every=progress_every,
+        )
+
+    if "localized" in selected_branches:
+        localized_results = run_localized_feature_tests(
+            balance_feature_matrix,
+            meta,
+            windows=config.windows,
+            config=config.feature_test,
+            progress_every=progress_every,
+        )
 
     gene_summary = summarize_gene_trajectories(
         balance_summary,
         discrete_results,
         continuous_results,
         localized_results,
+        branches=selected_branches,
     )
 
     (
@@ -1984,13 +1893,15 @@ def run_isovita_pipeline(
         final_features,
     ) = select_final_gene_features(
         gene_summary,
+        branches=selected_branches,
         config=config.selection,
     )
 
     return IsoVitaPipelineResult(
-        postnatal_meta=postnatal_meta,
-        full_expression_df=full_expression_df,
-        expression_df=expression_df,
+        selected_branches=selected_branches,
+        metadata=meta,
+        tpm=full_tpm,
+        isoplex_expression_df=isoplex_expression_df,
         isoplex_filter_summary=isoplex_filter_summary,
         sample_metrics=sample_metrics,
         global_metrics=global_metrics,
@@ -2018,7 +1929,7 @@ def save_isovita_pipeline_outputs(
     result: IsoVitaPipelineResult,
     output_dir: str | Path,
 ) -> None:
-    """Write major shared, branch-specific, and merged pipeline tables to CSV."""
+    """Write shared outputs plus results for branches that were actually run."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2030,18 +1941,43 @@ def save_isovita_pipeline_outputs(
         "balance_summary.csv": result.balance_summary,
         "balance_loadings.csv": result.balance_loadings,
         "balance_feature_matrix.csv": result.balance_feature_matrix,
-        "discrete_trajectory_results.csv": result.discrete_trajectory_results,
-        "continuous_trajectory_results.csv": result.continuous_trajectory_results,
-        "localized_trajectory_results.csv": result.localized_trajectory_results,
         "gene_trajectory_summary.csv": result.gene_trajectory_summary,
-        "discrete_trajectory_candidates.csv": result.discrete_trajectory_candidates,
-        "continuous_trajectory_candidates.csv": result.continuous_trajectory_candidates,
-        "localized_trajectory_candidates.csv": result.localized_trajectory_candidates,
         "final_features.csv": result.final_features,
     }
+
+    branch_tables = {
+        "discrete": (
+            "discrete_trajectory_results.csv",
+            result.discrete_trajectory_results,
+            "discrete_trajectory_candidates.csv",
+            result.discrete_trajectory_candidates,
+        ),
+        "continuous": (
+            "continuous_trajectory_results.csv",
+            result.continuous_trajectory_results,
+            "continuous_trajectory_candidates.csv",
+            result.continuous_trajectory_candidates,
+        ),
+        "localized": (
+            "localized_trajectory_results.csv",
+            result.localized_trajectory_results,
+            "localized_trajectory_candidates.csv",
+            result.localized_trajectory_candidates,
+        ),
+    }
+
+    for branch in result.selected_branches:
+        results_name, results_df, candidates_name, candidates_df = branch_tables[branch]
+        tables[results_name] = results_df
+        tables[candidates_name] = candidates_df
 
     for filename, table in tables.items():
         table.to_csv(
             output_dir / filename,
             index=(filename == "balance_feature_matrix.csv"),
         )
+
+    (output_dir / "selected_branches.txt").write_text(
+        "\n".join(result.selected_branches) + "\n"
+    )
+

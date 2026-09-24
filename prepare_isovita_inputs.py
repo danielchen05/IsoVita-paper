@@ -2,63 +2,33 @@
 prepare_isovita_inputs.py
 =========================
 
-Reusable preparation of transcript-level inputs for the current IsoVita
-workflow.
+Dataset-level preparation for the core IsoVita algorithm.
 
-This module converts an AnnData transcript-abundance object, sample metadata,
-and a transcript-to-gene mapping into one standardized input set that can be
-passed directly to ``run_isovita_pipeline()``.
+This module owns everything needed to turn raw transcript abundance plus
+metadata and a transcript-to-gene mapping into the canonical inputs expected by
+``isovita.run_isovita_pipeline()``. The core algorithm therefore starts from a
+fully harmonized, gene-annotated TPM matrix rather than repeating dataset
+preparation logic.
 
-The preparation layer is intentionally dataset-level only. It handles:
+Preparation responsibilities
+----------------------------
+1. Load/filter sample metadata, including the postnatal restriction by default.
+2. Extract a transcript x sample TPM matrix from AnnData (or accept one directly).
+3. Parse and harmonize sample IDs.
+4. Normalize and merge the transcript-to-gene mapping.
+5. Restrict/reorder TPM columns to exactly the retained metadata samples.
+6. Validate the canonical IsoVita input contract.
+7. Save ``tpm.tsv``, ``metadata.tsv``, and a preparation summary.
 
-1. Load sample metadata.
-2. Apply optional cohort filters (for example, region=HIPPO and dx=Control).
-3. Extract a transcript x sample TPM/abundance matrix from AnnData.
-4. Harmonize sample IDs between expression and metadata.
-5. Normalize the transcript-to-gene mapping.
-6. Validate consistency.
-7. Save standardized IsoVita inputs.
+Canonical output contract
+-------------------------
+``tpm`` contains ``gene_id``, ``transcript_id``, then one column per retained
+sample. ``metadata`` contains canonical ``sample_id`` and numeric ``age`` and is
+ordered identically to the TPM sample columns.
 
-It deliberately does NOT:
-- depend on SPIT;
-- perform SPIT preprocessing or dominance filtering;
-- apply IsoVita transcript-expression filters;
-- run IsoPlex;
-- select effective isoforms;
-- construct sparse balances;
-- remove prenatal samples;
-- run any temporal detection branch;
-- perform train/test splitting.
-
-Those operations either belong inside IsoVita itself or are no longer part of
-the current workflow. In particular, ``run_isovita_pipeline()`` performs the
-postnatal restriction internally before IsoPlex and downstream analysis.
-
-Expected output
----------------
-output_dir/
-    tpm.tsv
-    metadata.tsv
-    tx2gene.tsv
-    preparation_summary.tsv
-
-Example: hippocampus controls
------------------------------
-python prepare_isovita_inputs.py \
-    --adata ../data/transcript_counts.h5ad \
-    --metadata ../data/metadata.tsv \
-    --tx2gene ../data/tx2gene.csv \
-    --output-dir ../data/HPC_isovita_inputs \
-    --metadata-sep tab \
-    --filter region=HIPPO \
-    --filter dx=Control \
-    --metadata-sample-col sample_id \
-    --age-col age \
-    --abundance-key abundance \
-    --sample-id-mode underscore_prefix \
-    --sample-id-parts 2
-
-The same functions can also be imported and used from Python.
+This module deliberately does not run IsoPlex, construct the one-feature-per-gene
+balance, or run discrete/continuous/localized tests. Those are core IsoVita
+operations.
 """
 
 from __future__ import annotations
@@ -68,7 +38,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Mapping, Optional, Sequence, Tuple
 
-import anndata as ad
+try:
+    import anndata as ad
+except ImportError:  # Optional unless the AnnData adapter/CLI is used.
+    ad = None
+
 import numpy as np
 import pandas as pd
 
@@ -80,11 +54,10 @@ import pandas as pd
 
 @dataclass
 class PreparedIsoVitaInputs:
-    """Standardized data objects produced by the preparation workflow."""
+    """Canonical TPM/metadata objects ready for ``run_isovita_pipeline()``."""
 
     tpm: pd.DataFrame
     metadata: pd.DataFrame
-    tx2gene: pd.DataFrame
     summary: pd.DataFrame
 
 
@@ -158,14 +131,9 @@ def prepare_metadata(
     age_col: str,
     filters: Optional[Mapping[str, object]] = None,
     canonical_sample_col: str = "sample_id",
+    postnatal_only: bool = True,
 ) -> pd.DataFrame:
-    """
-    Filter and standardize sample metadata.
-
-    Prenatal samples are intentionally retained here. The current IsoVita
-    pipeline performs its postnatal restriction internally, keeping this
-    preparation module independent of inferential choices.
-    """
+    """Filter and standardize metadata before it reaches the IsoVita core."""
     meta = apply_metadata_filters(metadata, filters)
 
     required = {sample_col, age_col}
@@ -177,6 +145,12 @@ def prepare_metadata(
     meta[sample_col] = meta[sample_col].astype(str)
     meta[age_col] = pd.to_numeric(meta[age_col], errors="coerce")
     meta = meta.dropna(subset=[sample_col, age_col]).copy()
+
+    if postnatal_only:
+        meta = meta.loc[meta[age_col] >= 0].copy()
+
+    if meta.empty:
+        raise ValueError("No metadata rows remain after the requested filters.")
 
     if canonical_sample_col != sample_col:
         meta[canonical_sample_col] = meta[sample_col].astype(str)
@@ -197,7 +171,10 @@ def prepare_metadata(
             f"Examples: {duplicate_ids[:10]}"
         )
 
-    return meta.reset_index(drop=True)
+    # Put the two canonical columns first while preserving useful dataset columns.
+    first = [canonical_sample_col, "age"]
+    remaining = [c for c in meta.columns if c not in first]
+    return meta[first + remaining].reset_index(drop=True)
 
 
 # ============================================================================
@@ -428,6 +405,55 @@ def normalize_tx2gene(
     return mapping.reset_index(drop=True)
 
 
+def annotate_tpm_with_genes(
+    expression: pd.DataFrame,
+    tx2gene: pd.DataFrame,
+    *,
+    transcript_col: str = "tx_id",
+) -> pd.DataFrame:
+    """Merge gene IDs into TPM and return canonical gene/transcript columns."""
+    if transcript_col not in expression.columns:
+        raise ValueError(
+            f"Expression table is missing transcript column {transcript_col!r}."
+        )
+
+    expr = expression.copy()
+    expr[transcript_col] = expr[transcript_col].astype(str)
+    mapping = tx2gene[["tx_id", "gene_id"]].copy()
+
+    merged = expr.merge(
+        mapping,
+        left_on=transcript_col,
+        right_on="tx_id",
+        how="left",
+        validate="one_to_one",
+        suffixes=("", "_mapping"),
+    )
+
+    if transcript_col == "tx_id":
+        merged = merged.rename(columns={"tx_id": "transcript_id"})
+    else:
+        merged = merged.drop(columns=["tx_id"]).rename(
+            columns={transcript_col: "transcript_id"}
+        )
+
+    missing_gene = merged["gene_id"].isna()
+    if missing_gene.any():
+        # Unmapped transcripts cannot be assigned to an IsoVita gene feature.
+        merged = merged.loc[~missing_gene].copy()
+
+    if merged.empty:
+        raise ValueError("No TPM transcripts overlap the transcript-to-gene mapping.")
+
+    merged["gene_id"] = merged["gene_id"].astype(str)
+    merged["transcript_id"] = merged["transcript_id"].astype(str)
+    sample_cols = [
+        c for c in merged.columns
+        if c not in {"gene_id", "transcript_id", "tx_id_mapping"}
+    ]
+    return merged[["gene_id", "transcript_id"] + sample_cols].copy()
+
+
 # ============================================================================
 # VALIDATION / SUMMARY
 # ============================================================================
@@ -436,18 +462,17 @@ def normalize_tx2gene(
 def validate_prepared_inputs(
     tpm: pd.DataFrame,
     metadata: pd.DataFrame,
-    tx2gene: pd.DataFrame,
     *,
-    transcript_col: str = "tx_id",
     sample_col: str = "sample_id",
     age_col: str = "age",
 ) -> None:
-    """Validate the core invariants expected by ``run_isovita_pipeline()``."""
-    if transcript_col not in tpm.columns:
-        raise ValueError(f"TPM table is missing transcript column {transcript_col!r}.")
-
-    if not tpm[transcript_col].is_unique:
-        raise ValueError("TPM transcript IDs are not unique.")
+    """Validate the exact canonical contract consumed by the IsoVita core."""
+    required_tpm = {"gene_id", "transcript_id"}
+    missing_tpm = required_tpm - set(tpm.columns)
+    if missing_tpm:
+        raise ValueError(f"TPM missing canonical columns: {sorted(missing_tpm)}")
+    if tpm["transcript_id"].duplicated().any():
+        raise ValueError("TPM transcript_id values are not unique.")
 
     required_meta = {sample_col, age_col}
     missing_meta = required_meta - set(metadata.columns)
@@ -455,66 +480,48 @@ def validate_prepared_inputs(
         raise ValueError(
             f"Metadata missing required standardized columns: {sorted(missing_meta)}"
         )
-
     if metadata[sample_col].duplicated().any():
         raise ValueError("Metadata sample IDs are not unique.")
-
-    sample_ids = metadata[sample_col].astype(str).tolist()
-    if list(tpm.columns[1:]) != sample_ids:
-        raise ValueError(
-            "TPM sample columns do not exactly match standardized metadata order."
-        )
 
     age = pd.to_numeric(metadata[age_col], errors="coerce")
     if age.isna().any():
         raise ValueError("Standardized metadata age contains missing/non-numeric values.")
 
-    required_mapping = {"tx_id", "gene_id"}
-    missing_mapping = required_mapping - set(tx2gene.columns)
-    if missing_mapping:
+    sample_ids = metadata[sample_col].astype(str).tolist()
+    tpm_sample_cols = [
+        str(c) for c in tpm.columns if c not in {"gene_id", "transcript_id"}
+    ]
+    if tpm_sample_cols != sample_ids:
         raise ValueError(
-            f"tx2gene missing required columns: {sorted(missing_mapping)}"
+            "TPM sample columns do not exactly match standardized metadata order."
         )
 
-    if not tx2gene["tx_id"].is_unique:
-        raise ValueError("tx2gene transcript IDs are not unique.")
-
-    expression_tx = set(tpm[transcript_col].astype(str))
-    mapped_tx = set(tx2gene["tx_id"].astype(str))
-    if not (expression_tx & mapped_tx):
-        raise ValueError("No expression transcripts overlap the tx2gene mapping.")
+    numeric = tpm[tpm_sample_cols].apply(pd.to_numeric, errors="coerce")
+    if numeric.isna().any().any():
+        raise ValueError("TPM contains missing/non-numeric sample values.")
+    values = numeric.to_numpy(dtype=float)
+    if np.any(~np.isfinite(values)):
+        raise ValueError("TPM contains non-finite sample values.")
+    if np.any(values < 0):
+        raise ValueError("TPM values must be non-negative.")
 
 
 def build_preparation_summary(
     *,
     metadata: pd.DataFrame,
-    expression: pd.DataFrame,
-    tx2gene: pd.DataFrame,
+    tpm: pd.DataFrame,
     age_col: str = "age",
-    transcript_col: str = "tx_id",
 ) -> pd.DataFrame:
-    """Build a compact machine-readable summary of prepared data."""
+    """Build a compact machine-readable summary of final core inputs."""
     age = pd.to_numeric(metadata[age_col], errors="coerce")
-    n_prenatal = int((age < 0).sum())
-    n_postnatal = int((age >= 0).sum())
-
-    expression_tx = set(expression[transcript_col].astype(str))
-    mapped_tx = set(tx2gene["tx_id"].astype(str))
-    mapped_expression_tx = expression_tx & mapped_tx
-
     rows = [
-        ("matched_samples", int(len(metadata))),
-        ("prenatal_samples_retained", n_prenatal),
-        ("postnatal_samples", n_postnatal),
-        ("expression_transcripts", int(len(expression))),
-        ("expression_transcripts_with_tx2gene", int(len(mapped_expression_tx))),
-        ("expression_transcripts_without_tx2gene", int(len(expression_tx - mapped_tx))),
-        ("tx2gene_transcripts", int(tx2gene["tx_id"].nunique())),
-        ("tx2gene_genes", int(tx2gene["gene_id"].nunique())),
+        ("retained_samples", int(len(metadata))),
+        ("retained_transcripts", int(tpm["transcript_id"].nunique())),
+        ("retained_genes", int(tpm["gene_id"].nunique())),
         ("age_min", float(age.min())),
         ("age_max", float(age.max())),
+        ("n_negative_age", int((age < 0).sum())),
     ]
-
     return pd.DataFrame(rows, columns=["metric", "value"])
 
 
@@ -534,19 +541,16 @@ def prepare_isovita_inputs_from_expression(
     expression_transcript_col: str = "tx_id",
     tx2gene_transcript_col: Optional[str] = None,
     tx2gene_gene_col: Optional[str] = None,
+    postnatal_only: bool = True,
 ) -> PreparedIsoVitaInputs:
-    """
-    Prepare one standardized IsoVita input set from a transcript x sample table.
-
-    The returned objects can be passed directly as ``tpm``, ``metadata``, and
-    ``tx2gene`` to ``run_isovita_pipeline()``.
-    """
+    """Prepare canonical gene-annotated TPM and metadata from a table."""
     meta = prepare_metadata(
         metadata,
         sample_col=metadata_sample_col,
         age_col=age_col,
         filters=metadata_filters,
         canonical_sample_col="sample_id",
+        postnatal_only=postnatal_only,
     )
 
     expr = expression.copy()
@@ -555,10 +559,8 @@ def prepare_isovita_inputs_from_expression(
             f"Expression table is missing transcript column "
             f"{expression_transcript_col!r}."
         )
-
     if expression_transcript_col != "tx_id":
         expr = expr.rename(columns={expression_transcript_col: "tx_id"})
-
     expr["tx_id"] = expr["tx_id"].astype(str)
     if not expr["tx_id"].is_unique:
         raise ValueError("Expression transcript IDs must be unique.")
@@ -575,28 +577,14 @@ def prepare_isovita_inputs_from_expression(
         transcript_col=tx2gene_transcript_col,
         gene_col=tx2gene_gene_col,
     )
+    canonical_tpm = annotate_tpm_with_genes(expr, mapping, transcript_col="tx_id")
 
-    validate_prepared_inputs(
-        expr,
-        matched_meta,
-        mapping,
-        transcript_col="tx_id",
-        sample_col="sample_id",
-        age_col="age",
-    )
-
-    summary = build_preparation_summary(
-        metadata=matched_meta,
-        expression=expr,
-        tx2gene=mapping,
-        age_col="age",
-        transcript_col="tx_id",
-    )
+    validate_prepared_inputs(canonical_tpm, matched_meta)
+    summary = build_preparation_summary(metadata=matched_meta, tpm=canonical_tpm)
 
     return PreparedIsoVitaInputs(
-        tpm=expr,
+        tpm=canonical_tpm,
         metadata=matched_meta,
-        tx2gene=mapping,
         summary=summary,
     )
 
@@ -613,6 +601,7 @@ def prepare_isovita_inputs(
     sample_id_parser: Optional[Callable[[str], str]] = None,
     tx2gene_transcript_col: Optional[str] = None,
     tx2gene_gene_col: Optional[str] = None,
+    postnatal_only: bool = True,
 ) -> PreparedIsoVitaInputs:
     """AnnData adapter for :func:`prepare_isovita_inputs_from_expression`."""
     expression = extract_transcript_abundance(
@@ -621,7 +610,6 @@ def prepare_isovita_inputs(
         sample_id_parser=sample_id_parser,
         transcript_id_col="tx_id",
     )
-
     return prepare_isovita_inputs_from_expression(
         expression=expression,
         metadata=metadata,
@@ -632,6 +620,7 @@ def prepare_isovita_inputs(
         expression_transcript_col="tx_id",
         tx2gene_transcript_col=tx2gene_transcript_col,
         tx2gene_gene_col=tx2gene_gene_col,
+        postnatal_only=postnatal_only,
     )
 
 
@@ -641,17 +630,13 @@ def save_prepared_inputs(
     *,
     sep: str = "\t",
 ) -> None:
-    """Write the standardized IsoVita input set to disk."""
+    """Write exactly the canonical inputs consumed by ``run_isovita_pipeline``."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     result.tpm.to_csv(output_dir / "tpm.tsv", sep=sep, index=False)
     result.metadata.to_csv(output_dir / "metadata.tsv", sep=sep, index=False)
-    result.tx2gene.to_csv(output_dir / "tx2gene.tsv", sep=sep, index=False)
     result.summary.to_csv(
-        output_dir / "preparation_summary.tsv",
-        sep=sep,
-        index=False,
+        output_dir / "preparation_summary.tsv", sep=sep, index=False
     )
 
 
@@ -782,6 +767,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    parser.add_argument(
+        "--include-prenatal",
+        action="store_true",
+        help=(
+            "Retain negative ages. By default preparation restricts to age >= 0 "
+            "so the core receives postnatal-only metadata."
+        ),
+    )
+
     return parser
 
 
@@ -794,6 +788,10 @@ def main() -> None:
 
     metadata = read_table(args.metadata, sep=metadata_sep)
     tx2gene = read_table(args.tx2gene, sep=tx2gene_sep)
+    if ad is None:
+        raise ImportError(
+            "The CLI/AnnData adapter requires the optional 'anndata' package."
+        )
     adata = ad.read_h5ad(args.adata)
 
     filters = parse_filter_arguments(args.filter)
@@ -813,6 +811,7 @@ def main() -> None:
         sample_id_parser=sample_parser,
         tx2gene_transcript_col=args.tx2gene_transcript_col,
         tx2gene_gene_col=args.tx2gene_gene_col,
+        postnatal_only=not args.include_prenatal,
     )
 
     save_prepared_inputs(result, args.output_dir)
