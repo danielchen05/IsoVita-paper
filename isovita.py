@@ -29,19 +29,21 @@ Core algorithm
    ``discrete``, ``continuous``, and/or ``localized``.
 5. Return branch-specific results and a final gene set equal to the union of
    FDR-significant genes from the selected branches. With one selected branch,
-   the final set is exactly that branch's selected genes.
+   the final set is exactly that branch's selected genes. When multiple branches
+   are selected, this union is a downstream combination of branch-wise calls; it
+   is not itself a separately FDR-calibrated omnibus family.
 
 The branches are parallel detectors, not mutually exclusive trajectory classes.
 IsoVita has no SPIT dependency.
 
 Inferential note
 ----------------
-The balance is learned using age. Therefore downstream p/q-values are best
-interpreted as screening/characterization statistics when the same samples are
-used for balance learning and testing. The discrete permutation test corrects
-its internal change-point search, but not the upstream age-informed balance
-construction. Confirmatory inference would require a pre-condensation test or
-sample splitting/cross-fitting.
+The balance is learned using age, so final branch p-values are obtained by
+permuting age and repeating the complete age-dependent feature-learning step
+(CLR smooth trajectories -> PC1 -> sparse balance) before recomputing each
+branch statistic. This full-pipeline permutation accounts for adaptive balance
+selection. IsoPlex/effective-isoform membership is held fixed across
+permutations because it depends only on expression, not age.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from itertools import product
 from pathlib import Path
+import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -129,7 +132,12 @@ class BalanceConfig:
 
 @dataclass(frozen=True)
 class DiscreteConfig:
-    """Pure-step change-point test settings for the discrete branch."""
+    """Pure-step change-point settings for the discrete branch.
+
+    ``n_permutations`` and ``random_seed`` are retained for the legacy
+    fixed-feature diagnostic test. Normal end-to-end IsoVita inference uses
+    ``IsoVitaConfig.inference`` for all selected branches.
+    """
 
     min_samples_side: int = 10
     min_fraction_side: float = 0.15
@@ -162,6 +170,18 @@ class FeatureTestConfig:
 
 
 @dataclass(frozen=True)
+class PermutationInferenceConfig:
+    """Selection-aware full-pipeline age-permutation inference settings."""
+
+    n_permutations: int = 1000
+    random_seed: int = 0
+
+    def __post_init__(self) -> None:
+        if self.n_permutations < 1:
+            raise ValueError("n_permutations must be >= 1.")
+
+
+@dataclass(frozen=True)
 class SelectionConfig:
     """Final union/ranking settings after the selected branches are merged."""
 
@@ -183,6 +203,9 @@ class IsoVitaConfig:
     balance: BalanceConfig = field(default_factory=BalanceConfig)
     discrete: DiscreteConfig = field(default_factory=DiscreteConfig)
     feature_test: FeatureTestConfig = field(default_factory=FeatureTestConfig)
+    inference: PermutationInferenceConfig = field(
+        default_factory=PermutationInferenceConfig
+    )
     selection: SelectionConfig = field(default_factory=SelectionConfig)
 
 
@@ -656,6 +679,91 @@ def _fit_clr_trajectories(
     return age_grid, fitted_grid, centered_grid
 
 
+def _build_fixed_age_spline_workspace(
+    ages: np.ndarray,
+    *,
+    spline_df: int,
+    spline_degree: int,
+    age_grid_size: Optional[int] = None,
+) -> Dict[str, object]:
+    """Precompute a spline basis for a fixed multiset of age values.
+
+    Age permutations preserve the multiset of ages. Therefore the spline basis,
+    its rank, and (for feature learning) the prediction grid are unchanged; only
+    the expression/feature values assigned to those ages change.
+    """
+    ages = np.asarray(ages, dtype=float)
+    order = np.argsort(ages, kind="mergesort")
+    ages_sorted = ages[order]
+    formula = (
+        f"bs(age, df={int(spline_df)}, degree={int(spline_degree)}, "
+        "include_intercept=False)"
+    )
+    X_df = dmatrix(
+        formula,
+        {"age": ages_sorted},
+        return_type="dataframe",
+    )
+    X = np.asarray(X_df, dtype=float)
+    workspace: Dict[str, object] = {
+        "ages_sorted": ages_sorted,
+        "X": X,
+        "X_pinv": np.linalg.pinv(X),
+        "rank": int(np.linalg.matrix_rank(X)),
+    }
+
+    if age_grid_size is not None:
+        age_grid = np.linspace(
+            float(np.min(ages_sorted)),
+            float(np.max(ages_sorted)),
+            int(age_grid_size),
+        )
+        X_grid = np.asarray(
+            build_design_matrices(
+                [X_df.design_info],
+                {"age": age_grid},
+            )[0],
+            dtype=float,
+        )
+        workspace["age_grid"] = age_grid
+        workspace["X_grid"] = X_grid
+
+    return workspace
+
+
+def _fit_spline_f_from_fixed_age_workspace(
+    ages: np.ndarray,
+    y: np.ndarray,
+    workspace: Dict[str, object],
+) -> float:
+    """Compute the nested spline F statistic using a precomputed age basis."""
+    ages = np.asarray(ages, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if ages.shape != y.shape:
+        raise ValueError("ages and y must have the same shape.")
+    if len(y) < 3 or np.allclose(np.std(ages), 0) or np.allclose(np.std(y), 0):
+        return np.nan
+
+    order = np.argsort(ages, kind="mergesort")
+    y_sorted = y[order]
+    X = np.asarray(workspace["X"], dtype=float)
+    if len(y_sorted) != X.shape[0]:
+        raise ValueError("Age multiset does not match the precomputed spline workspace.")
+
+    beta = np.asarray(workspace["X_pinv"], dtype=float) @ y_sorted
+    fit1 = X @ beta
+    rss0 = float(np.sum((y_sorted - np.mean(y_sorted)) ** 2))
+    rss1 = float(np.sum((y_sorted - fit1) ** 2))
+    rank1 = int(workspace["rank"])
+    df_diff = rank1 - 1
+    df_resid = len(y_sorted) - rank1
+    if df_diff <= 0 or df_resid <= 0 or rss1 <= 0:
+        return np.nan
+    numerator = max(rss0 - rss1, 0.0) / df_diff
+    denominator = rss1 / df_resid
+    return float(numerator / denominator) if denominator > 0 else np.nan
+
+
 def _orient_pc1(pc1: np.ndarray) -> np.ndarray:
     """Give the SVD loading vector a deterministic sign."""
     v = np.asarray(pc1, dtype=float).copy()
@@ -848,6 +956,90 @@ def compute_balance_feature(
     return log_x[:, a].mean(axis=1) - log_x[:, b].mean(axis=1)
 
 
+def _learn_balance_from_prepared(
+    prepared: Dict[str, object],
+    ages: np.ndarray,
+    *,
+    config: BalanceConfig,
+    spline_workspace: Optional[Dict[str, object]] = None,
+    clr_values: Optional[np.ndarray] = None,
+) -> Dict[str, object]:
+    """Learn the age-informed sparse balance from an already prepared gene.
+
+    The effective-isoform composition is fixed. ``ages`` may be the observed age
+    vector or a permutation of it. When ``spline_workspace`` is supplied, the
+    function reuses the spline basis for the unchanged multiset of age values,
+    which makes full-pipeline permutation inference substantially faster.
+    """
+    isoforms = list(prepared["isoforms"])
+    samples = np.asarray(prepared["samples"], dtype=str)
+    composition = np.asarray(prepared["composition"], dtype=float)
+    ages = np.asarray(ages, dtype=float)
+
+    if len(ages) != len(samples):
+        raise ValueError("ages must align one-to-one with prepared samples.")
+    if np.any(~np.isfinite(ages)):
+        raise ValueError("ages must be finite.")
+
+    clr = (
+        np.asarray(clr_values, dtype=float)
+        if clr_values is not None
+        else clr_transform(composition)
+    )
+
+    if spline_workspace is None:
+        age_grid, fitted_grid, centered_grid = _fit_clr_trajectories(
+            ages,
+            clr,
+            spline_df=config.spline_df,
+            spline_degree=config.spline_degree,
+            age_grid_size=config.age_grid_size,
+        )
+    else:
+        order = np.argsort(ages, kind="mergesort")
+        clr_sorted = clr[order]
+        X = np.asarray(spline_workspace["X"], dtype=float)
+        if X.shape[0] != len(ages):
+            raise ValueError(
+                "Age multiset does not match the feature-learning spline workspace."
+            )
+        beta = np.asarray(spline_workspace["X_pinv"], dtype=float) @ clr_sorted
+        age_grid = np.asarray(spline_workspace["age_grid"], dtype=float)
+        X_grid = np.asarray(spline_workspace["X_grid"], dtype=float)
+        fitted_grid = X_grid @ beta
+        centered_grid = fitted_grid - fitted_grid.mean(axis=0, keepdims=True)
+
+    _, singular_values, vt = np.linalg.svd(centered_grid, full_matrices=False)
+    pc1 = _orient_pc1(vt[0])
+
+    balance = find_sparse_balance(
+        pc1,
+        near_optimal_cosine_tolerance=config.near_optimal_cosine_tolerance,
+        cache_candidate_directions_through_k=(
+            config.cache_candidate_directions_through_k
+        ),
+    )
+
+    assignment = np.asarray(balance["assignment"], dtype=np.int8)
+    direction = np.asarray(balance["direction"], dtype=float)
+    feature = compute_balance_feature(composition, assignment)
+
+    return {
+        "isoforms": isoforms,
+        "samples": samples,
+        "ages": ages,
+        "composition": composition,
+        "age_grid": age_grid,
+        "fitted_grid": fitted_grid,
+        "centered_grid": centered_grid,
+        "singular_values": singular_values,
+        "pc1": pc1,
+        "balance": balance,
+        "assignment": assignment,
+        "direction": direction,
+        "feature": feature,
+    }
+
 def fit_gene_balance(
     gene_id: str,
     expression_df: pd.DataFrame,
@@ -880,32 +1072,19 @@ def fit_gene_balance(
     isoforms = list(prepared["isoforms"])
     samples = np.asarray(prepared["samples"], dtype=str)
     ages = np.asarray(prepared["ages"], dtype=float)
-    composition = np.asarray(prepared["composition"], dtype=float)
 
     try:
-        clr = clr_transform(composition)
-        age_grid, fitted_grid, centered_grid = _fit_clr_trajectories(
+        learned = _learn_balance_from_prepared(
+            prepared,
             ages,
-            clr,
-            spline_df=config.spline_df,
-            spline_degree=config.spline_degree,
-            age_grid_size=config.age_grid_size,
+            config=config,
         )
-
-        _, singular_values, vt = np.linalg.svd(centered_grid, full_matrices=False)
-        pc1 = _orient_pc1(vt[0])
-
-        balance = find_sparse_balance(
-            pc1,
-            near_optimal_cosine_tolerance=config.near_optimal_cosine_tolerance,
-            cache_candidate_directions_through_k=(
-                config.cache_candidate_directions_through_k
-            ),
-        )
-
-        assignment = np.asarray(balance["assignment"], dtype=np.int8)
-        direction = np.asarray(balance["direction"], dtype=float)
-        feature = compute_balance_feature(composition, assignment)
+        singular_values = np.asarray(learned["singular_values"], dtype=float)
+        pc1 = np.asarray(learned["pc1"], dtype=float)
+        balance = learned["balance"]
+        assignment = np.asarray(learned["assignment"], dtype=np.int8)
+        direction = np.asarray(learned["direction"], dtype=float)
+        feature = np.asarray(learned["feature"], dtype=float)
 
         a_idx = np.flatnonzero(assignment == 1)
         b_idx = np.flatnonzero(assignment == -1)
@@ -966,7 +1145,6 @@ def fit_gene_balance(
             "n_samples": len(samples),
         }
         return summary, pd.DataFrame(), pd.Series(dtype=float, name=gene_id)
-
 
 def build_one_feature_per_gene(
     expression_df: pd.DataFrame,
@@ -1196,13 +1374,13 @@ def _permuted_max_step_f_statistics(
     return np.max(f_stats, axis=1)
 
 
-def _fit_discrete_step_test(
+def _fit_discrete_step_statistic(
     age: np.ndarray,
     y: np.ndarray,
     *,
     config: DiscreteConfig,
 ) -> Dict[str, object]:
-    """Fit and permutation-test one unknown pure step for a single gene."""
+    """Fit one unknown pure step and return the maximized observed statistic."""
     age = np.asarray(age, dtype=float)
     y = np.asarray(y, dtype=float)
     ok = np.isfinite(age) & np.isfinite(y)
@@ -1226,8 +1404,6 @@ def _fit_discrete_step_test(
         "delta_rss": np.nan,
         "step_r_squared": np.nan,
         "max_f_stat": np.nan,
-        "permutation_p_value": np.nan,
-        "p_value": np.nan,
         "min_samples_side_used": np.nan,
     }
 
@@ -1260,18 +1436,6 @@ def _fit_discrete_step_test(
     best_f = float(f_stats[best_idx])
     change_age = float((age_sorted[best_pos - 1] + age_sorted[best_pos]) / 2.0)
 
-    null_max_f = _permuted_max_step_f_statistics(
-        y_sorted,
-        cut_positions,
-        n_permutations=config.n_permutations,
-        random_seed=config.random_seed,
-    )
-    # +1 correction gives a valid Monte Carlo p-value and prevents p=0.
-    permutation_p = float(
-        (1 + np.count_nonzero(null_max_f >= best_f))
-        / (config.n_permutations + 1)
-    )
-
     base.update({
         "tested": True,
         "best_change_age": change_age,
@@ -1286,11 +1450,57 @@ def _fit_discrete_step_test(
         "delta_rss": float(np.asarray(stats["delta_rss"])[best_idx]),
         "step_r_squared": float(np.asarray(stats["step_r_squared"])[best_idx]),
         "max_f_stat": best_f,
-        "permutation_p_value": permutation_p,
-        "p_value": permutation_p,
     })
     return base
 
+
+def _fit_discrete_step_test(
+    age: np.ndarray,
+    y: np.ndarray,
+    *,
+    config: DiscreteConfig,
+) -> Dict[str, object]:
+    """Legacy fixed-feature permutation test for one unknown pure step.
+
+    This remains available for diagnostics or a feature specified independently
+    of age. For a normal IsoVita learned balance, use the full-pipeline
+    selection-aware inference functions below instead.
+    """
+    observed = _fit_discrete_step_statistic(age, y, config=config)
+    observed["permutation_p_value"] = np.nan
+    observed["p_value"] = np.nan
+
+    if not observed["tested"]:
+        return observed
+
+    age = np.asarray(age, dtype=float)
+    y = np.asarray(y, dtype=float)
+    ok = np.isfinite(age) & np.isfinite(y)
+    age = age[ok]
+    y = y[ok]
+    order = np.argsort(age, kind="mergesort")
+    age_sorted = age[order]
+    y_sorted = y[order]
+    cut_positions, _ = _valid_change_point_positions(
+        age_sorted,
+        min_samples_side=config.min_samples_side,
+        min_fraction_side=config.min_fraction_side,
+    )
+
+    null_max_f = _permuted_max_step_f_statistics(
+        y_sorted,
+        cut_positions,
+        n_permutations=config.n_permutations,
+        random_seed=config.random_seed,
+    )
+    best_f = float(observed["max_f_stat"])
+    permutation_p = float(
+        (1 + np.count_nonzero(null_max_f >= best_f))
+        / (config.n_permutations + 1)
+    )
+    observed["permutation_p_value"] = permutation_p
+    observed["p_value"] = permutation_p
+    return observed
 
 def run_discrete_feature_tests(
     balance_feature_matrix: pd.DataFrame,
@@ -1458,7 +1668,12 @@ def run_continuous_feature_tests(
     config: FeatureTestConfig = FeatureTestConfig(),
     progress_every: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Run the continuous branch: one global spline(age) test per gene."""
+    """Run a fixed-feature continuous test for diagnostics.
+
+    This conditional test is calibrated only when the supplied feature was
+    specified independently of age. Normal IsoVita inference uses
+    ``run_selection_aware_temporal_tests()`` instead.
+    """
     rows = []
 
     for i, (gene_id, feature_row) in enumerate(balance_feature_matrix.iterrows()):
@@ -1522,7 +1737,12 @@ def run_localized_feature_tests(
     config: FeatureTestConfig = FeatureTestConfig(),
     progress_every: Optional[int] = None,
 ) -> pd.DataFrame:
-    """Run the localized branch: spline(age) tests within configured age windows."""
+    """Run fixed-feature localized tests for diagnostics.
+
+    This conditional test is calibrated only when the supplied feature was
+    specified independently of age. Normal IsoVita inference uses
+    ``run_selection_aware_temporal_tests()`` instead.
+    """
     rows = []
     window_bins = np.asarray(windows.edges, dtype=float).copy()
     # Keep [a, b) windows while ensuring a sample exactly at the final edge
@@ -1591,6 +1811,491 @@ def run_localized_feature_tests(
         ascending=[True, True, True, True],
         na_position="last",
     ).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# SELECTION-AWARE FULL-PIPELINE PERMUTATION INFERENCE
+# ---------------------------------------------------------------------------
+
+
+def _localized_statistics_for_feature(
+    age: np.ndarray,
+    y: np.ndarray,
+    *,
+    windows: WindowConfig,
+    config: FeatureTestConfig,
+) -> Dict[str, Dict[str, object]]:
+    """Compute window-specific statistics for one feature without multiplicity correction."""
+    age = np.asarray(age, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if age.shape != y.shape:
+        raise ValueError("age and y must have the same shape.")
+
+    bins = np.asarray(windows.edges, dtype=float).copy()
+    bins[-1] = np.nextafter(bins[-1], np.inf)
+    labels = np.asarray(
+        pd.cut(
+            age,
+            bins=bins,
+            labels=list(windows.labels),
+            right=False,
+            include_lowest=True,
+        ).astype(object),
+        dtype=object,
+    )
+
+    out: Dict[str, Dict[str, object]] = {}
+    for label in windows.labels:
+        mask = labels == label
+        age_w = age[mask]
+        y_w = y[mask]
+        result = _fit_nested_spline_test(
+            age_w,
+            y_w,
+            spline_df=config.spline_df,
+            spline_degree=config.spline_degree,
+        )
+        result.update(_feature_correlations(age_w, y_w))
+        result["window"] = label
+        result["tested"] = bool(
+            result["n"] >= config.min_samples_window
+            and np.isfinite(result["f_stat"])
+        )
+        if not result["tested"]:
+            result["p_value"] = np.nan
+        out[label] = result
+    return out
+
+
+def _selection_aware_permutation_p_value(
+    observed_stat: float,
+    null_stats: np.ndarray,
+) -> float:
+    """Monte Carlo upper-tail p-value with the standard +1 correction."""
+    null_stats = np.asarray(null_stats, dtype=float)
+    if not np.isfinite(observed_stat):
+        return np.nan
+    if null_stats.size == 0 or np.any(~np.isfinite(null_stats)):
+        raise ValueError("All full-pipeline permutation statistics must be finite.")
+    return float(
+        (1 + np.count_nonzero(null_stats >= float(observed_stat)))
+        / (len(null_stats) + 1)
+    )
+
+
+def _run_selection_aware_gene_tests(
+    gene_id: str,
+    prepared: Dict[str, object],
+    observed_feature: np.ndarray,
+    *,
+    branches: Sequence[str],
+    balance_config: BalanceConfig,
+    discrete_config: DiscreteConfig,
+    feature_config: FeatureTestConfig,
+    windows: WindowConfig,
+    inference_config: PermutationInferenceConfig,
+) -> Dict[str, object]:
+    """Run selected branches for one gene with full age-permutation relearning."""
+    branches = normalize_branches(branches)
+    gene_id = str(gene_id)
+
+    ages = np.asarray(prepared["ages"], dtype=float)
+    samples = np.asarray(prepared["samples"], dtype=str)
+    observed_feature = np.asarray(observed_feature, dtype=float)
+    if len(observed_feature) != len(ages):
+        raise ValueError(
+            f"Observed feature for {gene_id} does not align with prepared samples."
+        )
+
+    result: Dict[str, object] = {}
+
+    # Observed statistics are computed from the balance learned with observed age.
+    if "discrete" in branches:
+        discrete_obs = _fit_discrete_step_statistic(
+            ages,
+            observed_feature,
+            config=discrete_config,
+        )
+        discrete_obs["gene_id"] = gene_id
+        result["discrete"] = discrete_obs
+
+    if "continuous" in branches:
+        continuous_obs = _fit_nested_spline_test(
+            ages,
+            observed_feature,
+            spline_df=feature_config.spline_df,
+            spline_degree=feature_config.spline_degree,
+        )
+        continuous_obs.update(_feature_correlations(ages, observed_feature))
+        continuous_obs["gene_id"] = gene_id
+        continuous_obs["tested"] = bool(
+            continuous_obs["n"] >= feature_config.min_samples_global
+            and np.isfinite(continuous_obs["f_stat"])
+        )
+        continuous_obs["analytic_p_value"] = continuous_obs["p_value"]
+        if not continuous_obs["tested"]:
+            continuous_obs["p_value"] = np.nan
+        result["continuous"] = continuous_obs
+
+    if "localized" in branches:
+        localized_obs = _localized_statistics_for_feature(
+            ages,
+            observed_feature,
+            windows=windows,
+            config=feature_config,
+        )
+        result["localized"] = localized_obs
+
+    # Precompute every object that depends only on the multiset of ages. A
+    # permutation changes which sample receives which age, but not these bases.
+    clr_values = clr_transform(np.asarray(prepared["composition"], dtype=float))
+    balance_workspace = _build_fixed_age_spline_workspace(
+        ages,
+        spline_df=balance_config.spline_df,
+        spline_degree=balance_config.spline_degree,
+        age_grid_size=balance_config.age_grid_size,
+    )
+
+    continuous_workspace = None
+    if "continuous" in branches and bool(result["continuous"]["tested"]):
+        continuous_workspace = _build_fixed_age_spline_workspace(
+            ages,
+            spline_df=feature_config.spline_df,
+            spline_degree=feature_config.spline_degree,
+        )
+
+    localized_workspaces: Dict[str, Dict[str, object]] = {}
+    if "localized" in branches:
+        edges = np.asarray(windows.edges, dtype=float).copy()
+        edges[-1] = np.nextafter(edges[-1], np.inf)
+        for i, label in enumerate(windows.labels):
+            if not bool(result["localized"][label]["tested"]):
+                continue
+            mask = (ages >= edges[i]) & (ages < edges[i + 1])
+            localized_workspaces[label] = _build_fixed_age_spline_workspace(
+                ages[mask],
+                spline_df=feature_config.spline_df,
+                spline_degree=feature_config.spline_degree,
+            )
+    else:
+        edges = np.asarray([], dtype=float)
+
+    B = int(inference_config.n_permutations)
+    perm_idx = _cached_permutation_indices(
+        len(samples),
+        B,
+        int(inference_config.random_seed),
+    )
+
+    discrete_null = np.empty(B, dtype=float) if "discrete" in branches else None
+    continuous_null = np.empty(B, dtype=float) if "continuous" in branches else None
+    localized_null = (
+        {label: np.empty(B, dtype=float) for label in windows.labels}
+        if "localized" in branches else None
+    )
+
+    # Each permutation repeats every age-dependent feature-learning step once.
+    # The resulting permuted feature is then shared across all selected branches.
+    for b in range(B):
+        permuted_ages = ages[perm_idx[b]]
+        learned = _learn_balance_from_prepared(
+            prepared,
+            permuted_ages,
+            config=balance_config,
+            spline_workspace=balance_workspace,
+            clr_values=clr_values,
+        )
+        permuted_feature = np.asarray(learned["feature"], dtype=float)
+
+        if discrete_null is not None:
+            if bool(result["discrete"]["tested"]):
+                stat = _fit_discrete_step_statistic(
+                    permuted_ages,
+                    permuted_feature,
+                    config=discrete_config,
+                )
+                if not bool(stat["tested"]) or not np.isfinite(stat["max_f_stat"]):
+                    raise RuntimeError(
+                        f"Discrete permutation became untestable for {gene_id}."
+                    )
+                discrete_null[b] = float(stat["max_f_stat"])
+            else:
+                discrete_null[b] = 0.0
+
+        if continuous_null is not None:
+            if bool(result["continuous"]["tested"]):
+                f_stat = _fit_spline_f_from_fixed_age_workspace(
+                    permuted_ages,
+                    permuted_feature,
+                    continuous_workspace,
+                )
+                if not np.isfinite(f_stat):
+                    raise RuntimeError(
+                        f"Continuous permutation became untestable for {gene_id}."
+                    )
+                continuous_null[b] = float(f_stat)
+            else:
+                continuous_null[b] = 0.0
+
+        if localized_null is not None:
+            for i, label in enumerate(windows.labels):
+                observed_window = result["localized"][label]
+                if not bool(observed_window["tested"]):
+                    localized_null[label][b] = 0.0
+                    continue
+
+                mask = (
+                    (permuted_ages >= edges[i])
+                    & (permuted_ages < edges[i + 1])
+                )
+                f_stat = _fit_spline_f_from_fixed_age_workspace(
+                    permuted_ages[mask],
+                    permuted_feature[mask],
+                    localized_workspaces[label],
+                )
+                if not np.isfinite(f_stat):
+                    raise RuntimeError(
+                        f"Localized permutation became untestable for "
+                        f"{gene_id}, window {label}."
+                    )
+                localized_null[label][b] = float(f_stat)
+
+    inference_label = "full_pipeline_age_permutation"
+
+    if discrete_null is not None:
+        obs = result["discrete"]
+        if bool(obs["tested"]):
+            p = _selection_aware_permutation_p_value(
+                float(obs["max_f_stat"]),
+                discrete_null,
+            )
+        else:
+            p = np.nan
+        obs["selection_aware_p_value"] = p
+        obs["permutation_p_value"] = p
+        obs["p_value"] = p
+        obs["n_permutations"] = B
+        obs["inference_method"] = inference_label
+
+    if continuous_null is not None:
+        obs = result["continuous"]
+        if bool(obs["tested"]):
+            p = _selection_aware_permutation_p_value(
+                float(obs["f_stat"]),
+                continuous_null,
+            )
+        else:
+            p = np.nan
+        obs["selection_aware_p_value"] = p
+        obs["p_value"] = p
+        obs["n_permutations"] = B
+        obs["inference_method"] = inference_label
+
+    if localized_null is not None:
+        for label in windows.labels:
+            obs = result["localized"][label]
+            obs["gene_id"] = gene_id
+            obs["analytic_p_value"] = obs["p_value"]
+            if bool(obs["tested"]):
+                p = _selection_aware_permutation_p_value(
+                    float(obs["f_stat"]),
+                    localized_null[label],
+                )
+            else:
+                p = np.nan
+            obs["selection_aware_p_value"] = p
+            obs["p_value"] = p
+            obs["n_permutations"] = B
+            obs["inference_method"] = inference_label
+
+    return result
+
+def run_selection_aware_temporal_tests(
+    expression_df: pd.DataFrame,
+    global_metrics: pd.DataFrame,
+    sample_cols: Sequence[str],
+    metadata: pd.DataFrame,
+    *,
+    branches: Sequence[str] = VALID_BRANCHES,
+    observed_feature_matrix: Optional[pd.DataFrame] = None,
+    balance_config: BalanceConfig = BalanceConfig(),
+    discrete_config: DiscreteConfig = DiscreteConfig(),
+    feature_config: FeatureTestConfig = FeatureTestConfig(),
+    windows: WindowConfig = WindowConfig(),
+    inference_config: PermutationInferenceConfig = PermutationInferenceConfig(),
+    progress_every: Optional[int] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Run selection-aware inference for any requested IsoVita branches.
+
+    For each gene, age is permuted and the complete age-informed balance is
+    relearned before recomputing the selected branch statistic(s). The same
+    relearned feature is shared by all selected branches within a permutation.
+
+    Notes
+    -----
+    ``run_discrete_feature_tests()``, ``run_continuous_feature_tests()``, and
+    ``run_localized_feature_tests()`` remain available as fixed-feature
+    diagnostics. Normal IsoVita inference should use this function (or
+    ``run_isovita_pipeline()``, which calls it automatically).
+    """
+    branches = normalize_branches(branches)
+    effective_map = get_effective_isoforms(global_metrics)
+
+    if observed_feature_matrix is not None:
+        genes = [
+            str(gene)
+            for gene in observed_feature_matrix.index
+            if str(gene) in effective_map and len(effective_map[str(gene)]) >= 2
+        ]
+    else:
+        genes = [gene for gene, txs in effective_map.items() if len(txs) >= 2]
+
+    rows: Dict[str, List[Dict[str, object]]] = {
+        "discrete": [],
+        "continuous": [],
+        "localized": [],
+    }
+
+    # Monte Carlo p-values cannot be smaller than 1/(B+1). Warn when that
+    # resolution is coarser than the first BH threshold for a selected family.
+    min_possible_p = 1.0 / (int(inference_config.n_permutations) + 1.0)
+    family_sizes = []
+    if "discrete" in branches:
+        family_sizes.append(("discrete", len(genes), discrete_config.alpha_fdr))
+    if "continuous" in branches:
+        family_sizes.append(("continuous", len(genes), feature_config.alpha_fdr))
+    if "localized" in branches:
+        family_sizes.append((
+            "localized",
+            len(genes) * len(windows.labels),
+            feature_config.alpha_fdr,
+        ))
+    for branch_name, family_size, alpha in family_sizes:
+        if family_size > 0 and min_possible_p > alpha / family_size:
+            warnings.warn(
+                f"{branch_name} permutation resolution may be coarse for BH: "
+                f"minimum p={min_possible_p:.3g}, first BH threshold="
+                f"{alpha / family_size:.3g}. Increase inference.n_permutations "
+                "when precise tail resolution is required.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    for i, gene_id in enumerate(genes):
+        if progress_every and i % progress_every == 0:
+            print(
+                f"Selection-aware inference: {i}/{len(genes)}",
+                flush=True,
+            )
+
+        prepared = make_effective_isoform_composition(
+            gene_id,
+            expression_df,
+            effective_map[gene_id],
+            sample_cols,
+            metadata,
+            pseudocount=balance_config.clr_pseudocount,
+            min_samples=balance_config.min_samples,
+        )
+        if prepared is None:
+            continue
+
+        samples = np.asarray(prepared["samples"], dtype=str)
+        if observed_feature_matrix is not None and gene_id in observed_feature_matrix.index:
+            feature_row = observed_feature_matrix.loc[gene_id]
+            missing = [sample for sample in samples if sample not in feature_row.index]
+            if missing:
+                raise ValueError(
+                    f"Observed feature matrix is missing samples for {gene_id}: "
+                    f"{missing[:5]}"
+                )
+            observed_feature = feature_row.loc[samples].to_numpy(dtype=float)
+        else:
+            learned = _learn_balance_from_prepared(
+                prepared,
+                np.asarray(prepared["ages"], dtype=float),
+                config=balance_config,
+            )
+            observed_feature = np.asarray(learned["feature"], dtype=float)
+
+        gene_result = _run_selection_aware_gene_tests(
+            gene_id,
+            prepared,
+            observed_feature,
+            branches=branches,
+            balance_config=balance_config,
+            discrete_config=discrete_config,
+            feature_config=feature_config,
+            windows=windows,
+            inference_config=inference_config,
+        )
+
+        if "discrete" in branches:
+            rows["discrete"].append(dict(gene_result["discrete"]))
+        if "continuous" in branches:
+            rows["continuous"].append(dict(gene_result["continuous"]))
+        if "localized" in branches:
+            rows["localized"].extend(
+                dict(gene_result["localized"][label])
+                for label in windows.labels
+            )
+
+    out: Dict[str, pd.DataFrame] = {
+        "discrete": pd.DataFrame(rows["discrete"]),
+        "continuous": pd.DataFrame(rows["continuous"]),
+        "localized": pd.DataFrame(rows["localized"]),
+    }
+
+    if "discrete" in branches and not out["discrete"].empty:
+        table = add_bh_fdr(
+            out["discrete"],
+            "p_value",
+            alpha=discrete_config.alpha_fdr,
+            valid_mask=out["discrete"]["tested"],
+            q_col="q_value",
+            reject_col="fdr_significant",
+        )
+        out["discrete"] = table.sort_values(
+            ["q_value", "p_value", "abs_step_effect", "gene_id"],
+            ascending=[True, True, False, True],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if "continuous" in branches and not out["continuous"].empty:
+        table = add_bh_fdr(
+            out["continuous"],
+            "p_value",
+            alpha=feature_config.alpha_fdr,
+            valid_mask=out["continuous"]["tested"],
+            q_col="q_value",
+            reject_col="fdr_significant",
+        )
+        table["score_predictive_hybrid"] = (
+            table["abs_pearson_r"].fillna(0.0)
+            * table["fitted_robust_amp"].fillna(0.0)
+        )
+        out["continuous"] = table.sort_values(
+            ["q_value", "p_value", "score_predictive_hybrid"],
+            ascending=[True, True, False],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    if "localized" in branches and not out["localized"].empty:
+        table = add_bh_fdr(
+            out["localized"],
+            "p_value",
+            alpha=feature_config.alpha_fdr,
+            valid_mask=out["localized"]["tested"],
+            q_col="q_value",
+            reject_col="fdr_significant",
+        )
+        out["localized"] = table.sort_values(
+            ["q_value", "p_value", "gene_id", "window"],
+            ascending=[True, True, True, True],
+            na_position="last",
+        ).reset_index(drop=True)
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1849,34 +2554,26 @@ def run_isovita_pipeline(
         )
     )
 
-    discrete_results = pd.DataFrame()
-    continuous_results = pd.DataFrame()
-    localized_results = pd.DataFrame()
+    # Final inference is selection-aware: every age permutation relearns the
+    # age-informed balance before recomputing the selected branch statistics.
+    branch_results = run_selection_aware_temporal_tests(
+        expression_df=full_tpm,
+        global_metrics=global_metrics,
+        sample_cols=sample_cols,
+        metadata=meta,
+        branches=selected_branches,
+        observed_feature_matrix=balance_feature_matrix,
+        balance_config=config.balance,
+        discrete_config=config.discrete,
+        feature_config=config.feature_test,
+        windows=config.windows,
+        inference_config=config.inference,
+        progress_every=progress_every,
+    )
 
-    if "discrete" in selected_branches:
-        discrete_results = run_discrete_feature_tests(
-            balance_feature_matrix,
-            meta,
-            config=config.discrete,
-            progress_every=progress_every,
-        )
-
-    if "continuous" in selected_branches:
-        continuous_results = run_continuous_feature_tests(
-            balance_feature_matrix,
-            meta,
-            config=config.feature_test,
-            progress_every=progress_every,
-        )
-
-    if "localized" in selected_branches:
-        localized_results = run_localized_feature_tests(
-            balance_feature_matrix,
-            meta,
-            windows=config.windows,
-            config=config.feature_test,
-            progress_every=progress_every,
-        )
+    discrete_results = branch_results["discrete"]
+    continuous_results = branch_results["continuous"]
+    localized_results = branch_results["localized"]
 
     gene_summary = summarize_gene_trajectories(
         balance_summary,
