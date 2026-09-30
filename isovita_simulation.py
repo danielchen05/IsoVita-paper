@@ -1,21 +1,25 @@
 """Reusable simulation utilities for IsoVita.
 
-The simulator intentionally generates transcript behavior *before* IsoVita's
-feature-condensation step. Each transcript receives its own latent log-abundance
-trajectory as a mixture of temporal components, after which the transcript
-vector is converted to within-gene composition by softmax.
+The simulator generates transcript-level temporal behavior before IsoVita's
+feature-condensation step. Each transcript receives a latent log-abundance
+trajectory defined by one or more temporal components. The transcript vector is
+then converted to within-gene composition with a softmax and finally scaled by
+a positive gene-level abundance to produce TPM-like values.
 
-This design avoids planting an exact A/B balance as the data-generating model,
-and can be reused for:
+The data-generating model intentionally does not plant an exact IsoVita A/B
+balance. This keeps simulation of transcript behavior separate from the method's
+feature-learning procedure.
 
-- feature-condensation intuition / stress-test figures;
-- null calibration and empirical FDR simulations;
-- power studies under smooth, discrete, localized, or mixed trajectories;
+The helper is intended for:
+
+- feature-condensation intuition and stress tests;
+- null calibration and empirical FDR studies;
+- power studies for discrete and smooth temporal trajectories; and
 - sensitivity analyses over sample size, noise, isoform count, age design, and
   temporal rank.
 
-The module does not depend on IsoVita itself. It only produces objects that are
-compatible with ``isovita.build_one_feature_per_gene`` and related functions.
+``gaussian_bump`` is retained only as a generic nonlinear temporal shape for
+feature-condensation stress tests. It is not an IsoVita detection branch.
 """
 
 from __future__ import annotations
@@ -25,6 +29,16 @@ from typing import Mapping, Optional, Sequence
 
 import numpy as np
 import pandas as pd
+
+
+SUPPORTED_TEMPORAL_BASES: tuple[str, ...] = (
+    "linear",
+    "sigmoid",
+    "step",
+    "u_shape",
+    "gaussian_bump",
+    "sinusoid",
+)
 
 
 # =============================================================================
@@ -40,23 +54,36 @@ class TemporalComponent:
     ----------
     kind
         Temporal shape. Supported values are ``linear``, ``sigmoid``, ``step``,
-        ``u_shape``, ``localized``, and ``sinusoid``.
+        ``u_shape``, ``gaussian_bump``, and ``sinusoid``.
     loadings
-        One coefficient per isoform. These need not form a balance and are not
-        normalized; they describe how strongly each transcript responds to this
-        temporal component on the latent log-abundance scale.
+        One coefficient per isoform. The loadings need not form a balance and
+        are not normalized; they describe transcript-specific responses on the
+        latent log-abundance scale.
     amplitude
         Global multiplier applied to this component.
     params
-        Shape-specific parameters. Examples: ``center`` and ``scale`` for a
-        sigmoid; ``change_age`` for a step; ``center`` and ``width`` for a
-        localized Gaussian bump; ``cycles`` and ``phase`` for a sinusoid.
+        Shape-specific parameters. Examples are ``center`` and ``scale`` for a
+        sigmoid, ``change_age`` for a step, ``center`` and ``width`` for a
+        Gaussian bump, and ``cycles`` and ``phase`` for a sinusoid.
     """
 
     kind: str
     loadings: tuple[float, ...]
     amplitude: float = 1.0
     params: Mapping[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.kind not in SUPPORTED_TEMPORAL_BASES:
+            raise ValueError(
+                f"Unknown temporal basis {self.kind!r}. Choose from: "
+                f"{', '.join(SUPPORTED_TEMPORAL_BASES)}."
+            )
+        if not np.isfinite(float(self.amplitude)):
+            raise ValueError("amplitude must be finite.")
+        if len(self.loadings) < 2:
+            raise ValueError("TemporalComponent requires at least two loadings.")
+        if np.any(~np.isfinite(np.asarray(self.loadings, dtype=float))):
+            raise ValueError("loadings must contain only finite values.")
 
 
 @dataclass(frozen=True)
@@ -80,17 +107,23 @@ class IsoformScenario:
     def __post_init__(self) -> None:
         if self.k < 2:
             raise ValueError("IsoVita simulation scenarios require at least 2 isoforms.")
+        if np.any(~np.isfinite(np.asarray(self.baselines, dtype=float))):
+            raise ValueError("baselines must contain only finite values.")
         if self.noise_sd < 0:
             raise ValueError("noise_sd must be non-negative.")
         if self.gene_total_log_sd < 0:
             raise ValueError("gene_total_log_sd must be non-negative.")
+        if not np.isfinite(self.gene_total_log_mean):
+            raise ValueError("gene_total_log_mean must be finite.")
         if self.noise_corr >= 1.0:
             raise ValueError("noise_corr must be < 1.")
+
         lower = -1.0 / max(self.k - 1, 1)
         if self.noise_corr <= lower:
             raise ValueError(
                 f"For K={self.k}, noise_corr must be greater than {lower:.3f}."
             )
+
         for component in self.components:
             if len(component.loadings) != self.k:
                 raise ValueError(
@@ -119,7 +152,7 @@ class SimulatedIsoVitaData:
         return out
 
     def as_dict(self) -> dict[str, pd.DataFrame]:
-        """Dictionary view convenient for notebooks."""
+        """Return a dictionary view convenient for notebooks."""
         return {
             "metadata": self.metadata,
             "expression": self.expression,
@@ -136,7 +169,7 @@ class SimulatedIsoVitaData:
 
 
 def _center_and_scale(values: np.ndarray) -> np.ndarray:
-    """Center a temporal basis and scale it to max absolute value 1."""
+    """Center a temporal basis and scale it to maximum absolute value 1."""
     x = np.asarray(values, dtype=float)
     x = x - np.mean(x)
     max_abs = float(np.max(np.abs(x)))
@@ -150,11 +183,19 @@ def temporal_basis(
     kind: str,
     params: Optional[Mapping[str, float]] = None,
 ) -> np.ndarray:
-    """Evaluate a standardized temporal basis on the supplied age vector."""
+    """Evaluate a centered, standardized temporal basis on an age vector."""
     age = np.asarray(age, dtype=float)
     params = dict(params or {})
+
     if age.ndim != 1 or len(age) == 0:
         raise ValueError("age must be a non-empty one-dimensional array.")
+    if np.any(~np.isfinite(age)):
+        raise ValueError("age must contain only finite values.")
+    if kind not in SUPPORTED_TEMPORAL_BASES:
+        raise ValueError(
+            f"Unknown temporal basis {kind!r}. Choose from: "
+            f"{', '.join(SUPPORTED_TEMPORAL_BASES)}."
+        )
 
     age_min = float(np.min(age))
     age_max = float(np.max(age))
@@ -182,23 +223,17 @@ def temporal_basis(
             raise ValueError("u_shape scale must be positive.")
         raw = ((age - center) / scale) ** 2
 
-    elif kind == "localized":
+    elif kind == "gaussian_bump":
         center = float(params.get("center", age_mid))
         width = float(params.get("width", age_span / 8.0))
         if width <= 0:
-            raise ValueError("localized width must be positive.")
+            raise ValueError("gaussian_bump width must be positive.")
         raw = np.exp(-0.5 * ((age - center) / width) ** 2)
 
-    elif kind == "sinusoid":
+    else:  # sinusoid
         cycles = float(params.get("cycles", 1.0))
         phase = float(params.get("phase", 0.0))
         raw = np.sin(2.0 * np.pi * cycles * (age - age_min) / age_span + phase)
-
-    else:
-        raise ValueError(
-            f"Unknown temporal basis {kind!r}. Supported: linear, sigmoid, step, "
-            "u_shape, localized, sinusoid."
-        )
 
     return _center_and_scale(raw)
 
@@ -243,10 +278,10 @@ def simulate_ages(
     design: str = "uniform",
     rng: Optional[np.random.Generator] = None,
 ) -> np.ndarray:
-    """Generate a reusable age design for simulation studies.
+    """Generate an age design for simulation studies.
 
     ``uniform`` samples continuously over the age range. ``balanced`` places
-    approximately equal numbers of samples across the range with small jitter.
+    approximately equally spaced samples across the range with small jitter.
     ``middle_heavy`` uses a beta distribution to create fewer boundary samples.
     """
     if n_samples < 2:
@@ -289,14 +324,15 @@ def simulate_isovita_dataset(
 ) -> SimulatedIsoVitaData:
     """Simulate transcript-level TPM-like data for one or more genes.
 
-    The noise-free latent log abundance for transcript ``j`` is
+    For transcript ``j`` in a simulated gene, the noise-free latent log abundance
+    is
 
     ``baseline_j + sum_m amplitude_m * loading_jm * h_m(age)``.
 
-    Correlated Gaussian noise is added on the same latent scale. Both the
-    noise-free and observed latent vectors are then converted to compositional
-    fractions with softmax. Observed fractions are multiplied by a positive
-    log-normal gene total to form TPM-like expression values.
+    Correlated Gaussian noise is added on the same latent scale. Noise-free and
+    observed latent vectors are converted to compositions by softmax. Observed
+    fractions are then multiplied by a positive log-normal gene total to form
+    TPM-like expression values.
     """
     scenarios = tuple(scenarios)
     if not scenarios:
@@ -328,6 +364,7 @@ def simulate_isovita_dataset(
         [f"{sample_prefix}{i:0{width}d}" for i in range(n_samples)],
         dtype=str,
     )
+
     metadata = pd.DataFrame({"age": age}, index=samples)
     metadata.index.name = "sample"
 
@@ -349,26 +386,29 @@ def simulate_isovita_dataset(
 
         component_values: dict[str, np.ndarray] = {}
         for component_index, component in enumerate(scenario.components, start=1):
-            h = temporal_basis(age, component.kind, component.params)
+            basis_values = temporal_basis(age, component.kind, component.params)
             loadings = np.asarray(component.loadings, dtype=float)
             latent_true += (
                 float(component.amplitude)
-                * h[:, None]
+                * basis_values[:, None]
                 * loadings[None, :]
             )
+
             component_name = f"component_{component_index}"
-            component_values[component_name] = h
+            component_values[component_name] = basis_values
 
             for tx, loading in zip(tx_ids, loadings):
-                loading_rows.append({
-                    "gene_id": scenario.gene_id,
-                    "transcript_id": tx,
-                    "component": component_name,
-                    "kind": component.kind,
-                    "amplitude": float(component.amplitude),
-                    "loading": float(loading),
-                    "scaled_loading": float(component.amplitude * loading),
-                })
+                loading_rows.append(
+                    {
+                        "gene_id": scenario.gene_id,
+                        "transcript_id": tx,
+                        "component": component_name,
+                        "kind": component.kind,
+                        "amplitude": float(component.amplitude),
+                        "loading": float(loading),
+                        "scaled_loading": float(component.amplitude * loading),
+                    }
+                )
 
         noise = _equicorrelated_noise(
             rng,
@@ -390,16 +430,20 @@ def simulate_isovita_dataset(
         tpm = observed_fraction * gene_total[:, None]
 
         for j, tx in enumerate(tx_ids):
-            expression_rows.append({
-                "gene_id": scenario.gene_id,
-                "transcript_id": tx,
-                **dict(zip(samples, tpm[:, j])),
-            })
-            global_metric_rows.append({
-                "gene_id": scenario.gene_id,
-                "transcript_id": tx,
-                "effective": True,
-            })
+            expression_rows.append(
+                {
+                    "gene_id": scenario.gene_id,
+                    "transcript_id": tx,
+                    **dict(zip(samples, tpm[:, j])),
+                }
+            )
+            global_metric_rows.append(
+                {
+                    "gene_id": scenario.gene_id,
+                    "transcript_id": tx,
+                    "effective": True,
+                }
+            )
 
             for i, sample in enumerate(samples):
                 row: dict[str, object] = {
@@ -419,16 +463,18 @@ def simulate_isovita_dataset(
                     row[component_name] = float(values[i])
                 fraction_rows.append(row)
 
-        scenario_rows.append({
-            "scenario_index": int(scenario_index),
-            "gene_id": scenario.gene_id,
-            "label": scenario.label,
-            "k": int(k),
-            "n_components": int(len(scenario.components)),
-            "noise_sd": float(scenario.noise_sd),
-            "noise_corr": float(scenario.noise_corr),
-            "notes": scenario.notes,
-        })
+        scenario_rows.append(
+            {
+                "scenario_index": int(scenario_index),
+                "gene_id": scenario.gene_id,
+                "label": scenario.label,
+                "k": int(k),
+                "n_components": int(len(scenario.components)),
+                "noise_sd": float(scenario.noise_sd),
+                "noise_corr": float(scenario.noise_corr),
+                "notes": scenario.notes,
+            }
+        )
 
     return SimulatedIsoVitaData(
         metadata=metadata,
@@ -446,12 +492,11 @@ def simulate_isovita_dataset(
 
 
 def make_feature_condensation_scenarios() -> tuple[IsoformScenario, ...]:
-    """Four manuscript-oriented cases for the feature-condensation supplement.
+    """Return four feature-condensation intuition/stress-test scenarios.
 
-    The cases progress from a two-isoform reference case to coherent multi-
-    isoform movement, sparse condensation with passenger trajectories, and a
-    genuinely multi-mode stress test in which one feature cannot represent all
-    temporal variation.
+    These scenarios assess whether the learned one-dimensional feature captures
+    the dominant transcript-composition trajectory when secondary temporal modes
+    are also present. They are not trajectory-detector benchmarks.
     """
     common_noise = 0.20
     common_corr = 0.10
@@ -469,7 +514,7 @@ def make_feature_condensation_scenarios() -> tuple[IsoformScenario, ...]:
                     params={"center": 38.0, "scale": 15.0},
                 ),
                 TemporalComponent(
-                    kind="localized",
+                    kind="gaussian_bump",
                     loadings=(0.18, -0.12),
                     amplitude=0.35,
                     params={"center": 18.0, "width": 7.0},
@@ -529,8 +574,8 @@ def make_feature_condensation_scenarios() -> tuple[IsoformScenario, ...]:
             noise_corr=common_corr,
             notes=(
                 "The main temporal axis is TX1/TX2 versus TX3. TX4 is weak and TX5 "
-                "has a real but secondary U-shaped trajectory, so 'unused' need not "
-                "mean biologically flat."
+                "has a real but secondary U-shaped trajectory, so an unused isoform "
+                "need not be biologically flat."
             ),
         ),
         IsoformScenario(
@@ -545,7 +590,7 @@ def make_feature_condensation_scenarios() -> tuple[IsoformScenario, ...]:
                     params={"center": 40.0, "scale": 16.0},
                 ),
                 TemporalComponent(
-                    kind="localized",
+                    kind="gaussian_bump",
                     loadings=(0.00, 0.00, 0.00, 0.00, 1.00, -1.00),
                     amplitude=1.10,
                     params={"center": 42.5, "width": 10.0},
@@ -555,8 +600,8 @@ def make_feature_condensation_scenarios() -> tuple[IsoformScenario, ...]:
             noise_corr=common_corr,
             notes=(
                 "Stress test: a dominant four-isoform smooth contrast coexists with "
-                "a strong orthogonal localized TX5-versus-TX6 mode. One condensed feature "
-                "should capture the dominant PC1 rather than all temporal structure."
+                "a strong orthogonal TX5-versus-TX6 Gaussian-bump mode. One condensed "
+                "feature should capture the dominant PC1 rather than all temporal structure."
             ),
         ),
     )
@@ -571,7 +616,7 @@ def make_null_scenarios(
     seed: int = 1,
     gene_prefix: str = "NULL",
 ) -> tuple[IsoformScenario, ...]:
-    """Convenience factory for age-null genes used in calibration studies."""
+    """Return age-null genes for calibration studies."""
     if n_genes < 1:
         raise ValueError("n_genes must be >= 1.")
     if k < 2:
@@ -596,6 +641,7 @@ def make_null_scenarios(
 
 
 __all__ = [
+    "SUPPORTED_TEMPORAL_BASES",
     "TemporalComponent",
     "IsoformScenario",
     "SimulatedIsoVitaData",
