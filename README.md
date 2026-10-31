@@ -31,7 +31,7 @@ This repository preserves the analysis-specific code and workflows used in the m
 
 The datasets, processed inputs, and analysis outputs are available on Zenodo:
 
-**[Zenodo DOI]**
+**[10.5281/zenodo.23840334](https://doi.org/10.5281/zenodo.23840334)**
 
 Download and extract the archive so that the `data/` directory is located at the repository root. See `data/README.md` for details.
 
