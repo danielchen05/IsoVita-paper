@@ -22,7 +22,7 @@ This repository preserves the analysis-specific code and workflows used in the m
 | `prepare_isovita_inputs.py` | Data preprocessing utilities |
 | `DLPFC_IsoVita_run.ipynb` | DLPFC analysis |
 | `HPC_IsoVita_run.ipynb` | Hippocampus analysis |
-| `Figure1_*.ipynb` – `Figure5_*.ipynb` | Main manuscript figures |
+| `Figure1_*.ipynb` - `Figure5_*.ipynb` | Main manuscript figures |
 | `SuppFigure_*.ipynb` | Supplementary figures |
 | `results/` | Simulation and analysis outputs |
 | `data/` | Input datasets, processed inputs, and analysis results (archived on Zenodo) |
