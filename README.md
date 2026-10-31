@@ -44,7 +44,18 @@ The analyses were conducted in Python. To reproduce the manuscript results:
 3. Install the required Python dependencies.
 4. Run the relevant analysis and figure-generation notebooks.
 
-The repository includes the analysis implementation used for the manuscript. For installation instructions and general usage of IsoVita, refer to the separate software repository.
+The repository includes the analysis implementation used for the manuscript. For installation instructions and general usage of IsoVita, refer to the separate software repository.  
+
+Python 3.10-3.12 is recommended.
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+The analysis notebooks use the local IsoVita implementation
+(`isovita.py`) included in this repository.
 
 ## Questions
 
