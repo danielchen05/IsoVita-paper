@@ -54,8 +54,9 @@ Install the dependencies:
 pip install -r requirements.txt
 ```
 
-The analysis notebooks use the local IsoVita implementation
-(`isovita.py`) included in this repository.
+This repository contains the analysis code used to generate the results and figures reported in the IsoVita manuscript. The implementation is preserved independently of the maintained IsoVita Python package (https://github.com/danielchen05/isovita), which may include subsequent updates and improvements.
+
+For reproduction of the manuscript results, use the scripts in this repository and the associated data and software environment.
 
 ## Questions
 
