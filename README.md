@@ -1,8 +1,15 @@
 # IsoVita: Manuscript Analyses
 
-**Citation:** [TBD]
-
 This repository contains the analysis scripts and Jupyter notebooks used to generate the results and figures for the IsoVita manuscript. 
+
+## Manuscript
+
+**Title:** *Learning interpretable compositional features associated with continuous covariates*  
+**Authors:** Xingyi Chen, Stephanie C. Hicks  
+**Venue:** bioRxiv (2026)  
+**DOI:** https://doi.org/10.64898/2026.11.04.764349
+
+If you use these analyses, please cite the manuscript above.
 
 ## Software package
 
